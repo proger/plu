@@ -192,7 +192,7 @@ def test_data(args):
     echo_loop(eval_dataloader, corpus)
 
 
-def cli():
+def main():
     parser = argparse.ArgumentParser(description="Is my data ok?")
     register_data_args(parser)
     args = parser.parse_args()

@@ -74,7 +74,7 @@ def print_histogram(counter):
     return cdf
 
 
-def cli():
+def main():
     args = parser.parse_args()
     input = args.input
     resample = args.resample

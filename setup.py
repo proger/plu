@@ -1,6 +1,5 @@
 from setuptools import setup
 import os
-import subprocess
 
 def get_long_description():
     with open(
@@ -29,9 +28,9 @@ setup(
     packages=["plu"],
     entry_points="""
         [console_scripts]
-        +balance=plu.balance:cli
-        +soundcheck=plu.soundcheck:cli
-        +dataloader=plu.dataloader:cli
+        +balance=plu.balance:main
+        +soundcheck=plu.soundcheck:main
+        +dataloader=plu.dataloader:main
     """,
     install_requires=["tiktoken", "openai-whisper", "soundfile", "transformers", "datasets"],
     python_requires=">=3.8",
