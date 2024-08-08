@@ -1,6 +1,5 @@
 import argparse
 from dataclasses import dataclass
-from pathlib import Path
 from typing import Any, Dict, List, Union
 import sys
 
@@ -55,7 +54,6 @@ class Corpus:
     def __call__(self, example):
         # load and (possibly) resample audio data to 16kHz
         audio = example["audio"]
-        print(example)
 
         # compute log-Mel input features from input audio array
         example["input_features"] = self.processor.feature_extractor(
@@ -72,26 +70,17 @@ class Corpus:
         return [50258] # sot
 
     def load_dataset(self, path_or_paths):
-
         dataset = load_dataset("json", data_files={"train": path_or_paths})["train"]
 
         if self.args.subsample:
             dataset = dataset.select(range(100))
 
         def resolve_paths(example):
-            root = "wav/" # must exist locally
-            example["audio"] = root + example["path"]
+            example["audio"] = example["path"]
             del example["path"]
             return example
 
         dataset = dataset.map(resolve_paths, desc="resolving paths")
-
-        def is_nonempty(example):
-            path = Path(example["audio"])
-            good = path.exists() and path.stat().st_size >= 1024
-            return good
-
-        dataset = dataset.filter(is_nonempty, desc="filtering for existing files of length at least 1024 bytes")
 
         print(dataset, file=sys.stderr)
 
@@ -203,7 +192,7 @@ def test_data(args):
     echo_loop(eval_dataloader, corpus)
 
 
-if __name__ == "__main__":
+def cli():
     parser = argparse.ArgumentParser(description="Is my data ok?")
     register_data_args(parser)
     args = parser.parse_args()

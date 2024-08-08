@@ -30,7 +30,7 @@ setup(
     entry_points="""
         [console_scripts]
         +balance=plu.balance:cli
-        +soundcheck=plu.cli:cli
+        +soundcheck=plu.soundcheck:cli
         +dataloader=plu.dataloader:cli
     """,
     install_requires=["tiktoken", "openai-whisper", "soundfile", "transformers", "datasets"],
