@@ -241,7 +241,7 @@ def main():
     if args.with_tracking:
         accelerator_kwargs["log_with"] = args.report_to
         accelerator_kwargs["project_dir"] = args.exp
-    accelerator = Accelerator(**accelerator_kwargs)
+    accelerator = Accelerator(mixed_precision='fp16', **accelerator_kwargs)
 
     # Make one log on every process with the configuration for debugging.
     logging.basicConfig(
