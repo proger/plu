@@ -13,7 +13,7 @@ from whisper.tokenizer import get_tokenizer
 
 @dataclass
 class DataCollatorSpeechSeq2SeqWithPadding:
-    processor: Any
+    processor: WhisperProcessor
 
     def __call__(self, features: List[Dict[str, Union[List[int], torch.Tensor]]]) -> Dict[str, torch.Tensor]:
         # split inputs and labels since they have to be of different lengths and need different padding methods
@@ -29,9 +29,10 @@ class DataCollatorSpeechSeq2SeqWithPadding:
         # replace padding with -100 to ignore loss correctly
         labels = labels_batch["input_ids"].masked_fill(labels_batch.attention_mask.ne(1), -100)
 
-        # if bos token is appended in previous tokenization step,
-        # cut bos token here as it's append later anyways
-        if (labels[:, 0] == self.processor.tokenizer.bos_token_id).all().cpu().item():
+        # if sot token is appended in previous tokenization step,
+        # cut sot token here as it's append later anyways
+        sot = 50258
+        if (labels[:, 0] == sot).all().cpu().item():
             labels = labels[:, 1:]
 
         batch["labels"] = labels
