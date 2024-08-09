@@ -246,13 +246,13 @@ def main():
     # Make one log on every process with the configuration for debugging.
     logging.basicConfig(
         format="%(asctime)s - %(levelname)s - %(name)s - %(message)s",
-        datefmt="%m/%d/%Y %H:%M:%S",
+        datefmt="%Y-%m-%dT%H:%M:%S%z",
         level=logging.INFO,
     )
-    logger.info(accelerator.state, main_process_only=False)
+    # logger.info(accelerator.state, main_process_only=False)
     if accelerator.is_local_main_process:
         datasets.utils.logging.set_verbosity_warning()
-        transformers.utils.logging.set_verbosity_info()
+        transformers.utils.logging.set_verbosity_error()
     else:
         datasets.utils.logging.set_verbosity_error()
         transformers.utils.logging.set_verbosity_error()
@@ -356,11 +356,10 @@ def main():
     accelerator.register_load_state_pre_hook(load_model_hook)
 
     total_batch_size = args.per_device_train_batch_size * accelerator.num_processes * args.gradient_accumulation_steps
-    logger.info("***** Running training *****")
-    logger.info(f"  Instantaneous batch size per device = {args.per_device_train_batch_size}")
-    logger.info(f"  Total train batch size (w. parallel, distributed & accumulation) = {total_batch_size}")
-    logger.info(f"  Gradient Accumulation steps = {args.gradient_accumulation_steps}")
-    logger.info(f"  Total optimization steps = {args.max_train_steps}")
+    logger.info(f"Instantaneous batch size per device = {args.per_device_train_batch_size}")
+    logger.info(f"Total train batch size (w. parallel, distributed & accumulation) = {total_batch_size}")
+    logger.info(f"Gradient Accumulation steps = {args.gradient_accumulation_steps}")
+    logger.info(f"Total optimization steps = {args.max_train_steps}")
     # Only show the progress bar once on each machine.
     progress_bar = tqdm(range(args.max_train_steps), disable=not accelerator.is_local_main_process)
     global_step = 0

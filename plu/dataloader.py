@@ -3,12 +3,15 @@ from dataclasses import dataclass
 from typing import Any, Dict, List, Union
 import sys
 
+from accelerate.logging import get_logger
 from datasets import Audio, load_dataset
 import numpy as np
 import torch
 from torch.utils.data import DataLoader
 from transformers import WhisperProcessor
 from whisper.tokenizer import get_tokenizer
+
+logger = get_logger(__name__, log_level="INFO")
 
 
 @dataclass
@@ -83,7 +86,7 @@ class Corpus:
 
         dataset = dataset.map(resolve_paths, desc="resolving paths")
 
-        print(dataset, file=sys.stderr)
+        logger.info(dataset)
 
         dataset = dataset.to_iterable_dataset(num_shards=self.args.preprocessing_num_workers)
         dataset = dataset.cast_column("audio", Audio(sampling_rate=16000))
