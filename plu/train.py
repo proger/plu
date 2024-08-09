@@ -174,7 +174,7 @@ def load_model_hook(models, input_dir):
         PeftModel.from_pretrained(model.base_model.model, input_dir)
 
 
-def evaluation_loop(model, eval_dataloader, processor, metric, forced_decoder_ids):
+def evaluation_loop(model, eval_dataloader, processor, metric):
     model.eval()
     predictions = []
     references = []
@@ -184,7 +184,6 @@ def evaluation_loop(model, eval_dataloader, processor, metric, forced_decoder_id
                 generated_tokens = (
                     model.generate(
                         input_features=batch["input_features"],
-                        forced_decoder_ids=forced_decoder_ids,
                         max_new_tokens=255,
                     )
                     .cpu()
@@ -302,15 +301,13 @@ def main():
         device_map["proj_out"] = model._hf_hook.execution_device
         dispatch_model(model, device_map=device_map)
 
-    forced_decoder_ids = corpus.get_decoder_prompt_ids()
-
     eval_dataloader = accelerator.prepare(eval_dataloader)
 
     if args.eval_at_init:
         model = accelerator.prepare(model)
         model = accelerator.prepare(model)
         init_eval_metrics, init_eval_outputs = evaluation_loop(
-            model, eval_dataloader, corpus.processor, metric, forced_decoder_ids
+            model, eval_dataloader, corpus.processor, metric
         )
         with open(os.path.join(args.exp, "init_results.json"), "w") as f:
             json.dump({"eval_metrics": init_eval_metrics,
@@ -428,7 +425,7 @@ def main():
 
         if do_eval:
             eval_metrics, eval_outputs = evaluation_loop(
-                model, eval_dataloader, corpus.processor, metric, forced_decoder_ids
+                model, eval_dataloader, corpus.processor, metric
             )
             if args.with_tracking:
                 logger.info(f"Step {global_step} eval metrics: {eval_metrics}")
@@ -447,7 +444,7 @@ def main():
 
     if not args.evaluation_steps:
         eval_metrics, eval_outputs = evaluation_loop(
-            model, eval_dataloader, corpus.processor, metric, forced_decoder_ids
+            model, eval_dataloader, corpus.processor, metric
         )
         if args.with_tracking:
             logger.info(f"Step {global_step} eval metrics: {eval_metrics}")
@@ -466,3 +463,5 @@ def main():
         json.dump({"eval_metrics": eval_metrics,
                    "eval_outputs": eval_outputs}, f)
 
+if __name__ == "__main__":
+    main()

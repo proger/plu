@@ -3,6 +3,8 @@ import json
 from logging import getLogger, basicConfig
 from pathlib import Path
 import subprocess
+from faster_whisper import WhisperModel
+from faster_whisper.tokenizer import Tokenizer
 
 from transformers import (
     WhisperForConditionalGeneration,
@@ -15,8 +17,8 @@ def parse_args():
     parser = argparse.ArgumentParser(description="Merge finetuned adapter into the model, convert to CTranslate2 and do a test with faster-whisper")
     parser.add_argument(
         "--exp",
-        type=str,
-        help="Path to pretrained model or model identifier from huggingface.co/models.",
+        type=Path,
+        help="Path to pretrained model or model identifier from huggingface.co/models. If you pass in the ctranslate2 model directory, skips the merge step.",
         default="exp/1",
     )
     parser.add_argument(
@@ -31,17 +33,57 @@ def parse_args():
 
 
 
-basicConfig(level="DEBUG")
+#basicConfig(level="DEBUG")
 logger = getLogger(__name__)
 
 
-def recognize(model: WhisperModel, filename: Path, prefix: str | None = None):
+class MyWhisperModel(WhisperModel):
+    def get_prompt(
+        self,
+        tokenizer: Tokenizer,
+        previous_tokens: list[int],
+        without_timestamps: bool = False,
+        prefix: str | None = None,
+        hotwords: str | None = None,
+    ) -> list[int]:
+        prompt = []
+
+        if previous_tokens or (hotwords and not prefix):
+            prompt.append(tokenizer.sot_prev)
+            if hotwords and not prefix:
+                hotwords_tokens = tokenizer.encode(" " + hotwords.strip())
+                if len(hotwords_tokens) >= self.max_length // 2:
+                    hotwords_tokens = hotwords_tokens[: self.max_length // 2 - 1]
+                prompt.extend(hotwords_tokens)
+            if previous_tokens:
+                prompt.extend(previous_tokens[-(self.max_length // 2 - 1) :])
+
+        #prompt.extend([tokenizer.sot, tokenizer.language, tokenizer.transcribe])
+        prompt.extend([50258, 50263, 50359])
+
+        if without_timestamps:
+            prompt.append(50363) # tokenizer.no_timestamps
+
+        if prefix:
+            prefix_tokens = tokenizer.encode(" " + prefix.strip())
+            if len(prefix_tokens) >= self.max_length // 2:
+                prefix_tokens = prefix_tokens[: self.max_length // 2 - 1]
+            if not without_timestamps:
+                prompt.append(tokenizer.timestamp_begin)
+            prompt.extend(prefix_tokens)
+
+        return prompt
+
+
+
+def recognize(model: MyWhisperModel, filename: Path, prefix: str | None = None):
     logger.debug("recognize %s", filename)
     try:
         segments, info = model.transcribe(
             str(filename),
             beam_size=5,
-            word_timestamps=True,
+            word_timestamps=False,
+            without_timestamps=True, # our training format doesn't have timestamps
             temperature=[0.0],
             prefix=prefix,
         )
@@ -49,18 +91,15 @@ def recognize(model: WhisperModel, filename: Path, prefix: str | None = None):
         logger.exception("failed to recognize %s", filename)
         return
 
-    metadata = dict(
-        filename=str(filename),
-        lang=info.language,
-        langprob=round(info.language_probability, 2),
-        duration=round(info.duration, 2),
-    )
-
     for i, segment in enumerate(segments):
         start = round(segment.start, 2)
         end = round(segment.end, 2)
-        text = "".join(word.word for word in segment.words)
-        conf = [round(word.probability, 2) for word in segment.words]
+        if segment.words:
+            text = "".join(word.word for word in segment.words)
+            conf = [round(word.probability, 2) for word in segment.words]
+        else:
+            text = segment.text
+            conf = None
         avg_logprob = round(segment.avg_logprob, 3)
         no_speech_prob = round(segment.no_speech_prob, 3)
         yield dict(
@@ -71,16 +110,25 @@ def recognize(model: WhisperModel, filename: Path, prefix: str | None = None):
             conf=conf,
             avg_logprob=avg_logprob,
             no_speech_prob=no_speech_prob,
-            metadata=metadata,
+            path=str(filename),
+            language=info.language,
+            langprob=round(info.language_probability, 2),
+            input_ids=segment.tokens,
         )
 
 
-def merge_and_convert(exp):
+def load_model(exp):
     model = WhisperForConditionalGeneration.from_pretrained(exp)
     tokenizer = AutoTokenizer.from_pretrained(exp)
 
     peft_model = PeftModel.from_pretrained(model, exp,)
     peft_model = peft_model.merge_and_unload()
+
+    return peft_model, tokenizer
+
+
+def merge_and_convert(exp):
+    peft_model, tokenizer = load_model(exp)
 
     merged_model_dir = Path(exp) / "merged"
     peft_model._hf_peft_config_loaded = False # wtf
@@ -112,11 +160,13 @@ def merge_and_convert(exp):
 
 def main():
     args = parse_args()
-    model_dir = merge_and_convert(args.exp)
+    if (args.exp / 'model.bin').exists():
+        model_dir = args.exp
+    else:
+        model_dir = merge_and_convert(args.exp)
 
     logger.warning("if this crashes, re-run with env LD_LIBRARY_PATH=/ai/env/lib/python3.10/site-packages/nvidia/cudnn/lib")
-    from faster_whisper import WhisperModel
-    model = WhisperModel(
+    model = MyWhisperModel(
         str(model_dir),
         device='cuda',
         compute_type='float16',
@@ -124,5 +174,6 @@ def main():
         cpu_threads=1,
     )
 
-    for seg in recognize(model, args.filenames):
-        print(seg)
+    for filename in args.filenames:
+        for seg in recognize(model, filename):
+            print(json.dumps(seg, ensure_ascii=False))
