@@ -82,30 +82,17 @@ def parse_args():
     parser.add_argument("--exp", type=str, default="exp/1", help="Where to store the checkpoints and the model files.")
     parser.add_argument("--seed", type=int, default=42, help="A seed for reproducible training.")
     parser.add_argument(
-        "--with_tracking",
-        type=bool,
-        default=True,
-        help="Whether to enable experiment trackers for logging.",
-    )
-    parser.add_argument(
         "--report_to",
         type=str,
         default="tensorboard",
         help=(
             'The integration to report the results and logs to. Supported platforms are `"tensorboard"`,'
             ' `"wandb"` and `"comet_ml"`. Use `"all"` (default) to report to all integrations.'
-            "Only applicable when `--with_tracking` is passed."
         ),
     )
     parser.add_argument("--hub_token", type=str, help="The token to use to push to the Model Hub.")
     parser.add_argument(
         "--hub_model_id", type=str, help="The name of the repository to keep in sync with the local `exp`."
-    )
-    parser.add_argument(
-        "--checkpointing_steps",
-        type=int,
-        default=0,
-        help="Whether the various states should be saved at the end of every n steps, or 0 for each epoch.",
     )
     parser.add_argument(
         "--logging_steps",
@@ -174,28 +161,28 @@ def load_model_hook(models, input_dir):
         PeftModel.from_pretrained(model.base_model.model, input_dir)
 
 
-def evaluation_loop(model, eval_dataloader, processor, metric):
+@torch.no_grad()
+def evaluation_loop(model, eval_dataloader, processor, metric, output_filename):
     model.eval()
     predictions = []
     references = []
     for _, batch in enumerate(tqdm(eval_dataloader)):
         with torch.cuda.amp.autocast():
-            with torch.no_grad():
-                generated_tokens = (
-                    model.generate(
-                        input_features=batch["input_features"],
-                        max_new_tokens=255,
-                    )
-                    .cpu()
-                    .numpy()
+            generated_tokens = (
+                model.generate(
+                    input_features=batch["input_features"],
+                    max_new_tokens=255,
                 )
-                labels = batch["labels"].cpu().numpy()
-                labels = np.where(labels != -100, labels, processor.tokenizer.pad_token_id)
-                decoded_preds = processor.tokenizer.batch_decode(generated_tokens, skip_special_tokens=True)
-                decoded_labels = processor.tokenizer.batch_decode(labels, skip_special_tokens=True)
-                predictions.extend(decoded_preds)
-                references.extend(decoded_labels)
-            del generated_tokens, labels, batch
+                .cpu()
+                .numpy()
+            )
+            labels = batch["labels"].cpu().numpy()
+            labels = np.where(labels != -100, labels, processor.tokenizer.pad_token_id)
+            decoded_preds = processor.tokenizer.batch_decode(generated_tokens, skip_special_tokens=True)
+            decoded_labels = processor.tokenizer.batch_decode(labels, skip_special_tokens=True)
+            predictions.extend(decoded_preds)
+            references.extend(decoded_labels)
+        del generated_tokens, labels, batch
         gc.collect()
     try:
         wer = 100 * metric.compute(predictions=predictions, references=references)
@@ -207,7 +194,12 @@ def evaluation_loop(model, eval_dataloader, processor, metric):
         print(f'{i} ref', ref, sep='\t')
         print(f'{i} hyp', hyp, sep='\t')
 
-    return eval_metrics, {"hyp": predictions, "ref": references}
+    with open(output_filename, "w") as f:
+        json.dump({"metrics": eval_metrics,
+                   "hyp": predictions,
+                   "ref": references}, f, ensure_ascii=False)
+
+    return eval_metrics
 
 
 def load_peft(model, args):
@@ -238,9 +230,8 @@ def main():
     args = parse_args()
 
     accelerator_kwargs = {"gradient_accumulation_steps": args.gradient_accumulation_steps}
-    if args.with_tracking:
-        accelerator_kwargs["log_with"] = args.report_to
-        accelerator_kwargs["project_dir"] = args.exp
+    accelerator_kwargs["log_with"] = args.report_to
+    accelerator_kwargs["project_dir"] = args.exp
     accelerator = Accelerator(mixed_precision='fp16', **accelerator_kwargs)
 
     # Make one log on every process with the configuration for debugging.
@@ -282,36 +273,27 @@ def main():
         bnb_4bit_use_double_quant=False,
     )
 
+
     model = WhisperForConditionalGeneration.from_pretrained(
         args.model_name_or_path, quantization_config=quant_config,
     )
+
+    # from openai-whisper
+    # ipdb> self.model.dims
+    # ModelDimensions(n_mels=128, n_audio_ctx=1500, n_audio_state=1280, n_audio_head=20, n_audio_layer=32, n_vocab=51866, n_text_ctx=448, n_text_state=1280, n_text_head=20, n_text_layer=32)
+
     model.config.forced_decoder_ids = None
     model.config.suppress_tokens = []
-    if len(set(model.hf_device_map.values()).intersection({"cpu", "disk"})) > 0:
-        raise ValueError("Training on CPU or disk is not supported.")
-    if len(set(model.hf_device_map.values())) > 1:
-        device_map = model.hf_device_map.copy()
-        # required because `labels` are on main execution device (0) while the output of `proj_out` is on other device.
-        # So, this leads to device mismatch error when calculation cross-entropy between logits and labels.
-        # Won't arise during inference as `labels` aren't supplied during that time
-        # instead of changing device of one of the tied modules, I have to do this for all tied modules
-        # else the execution device of remaining tied modules isn't changed
-        device_map["model.decoder.embed_tokens"] = model._hf_hook.execution_device
-        device_map["model.decoder.embed_positions"] = model._hf_hook.execution_device
-        device_map["proj_out"] = model._hf_hook.execution_device
-        dispatch_model(model, device_map=device_map)
+    model.config.decoder_start_token_id = 50258 # <|startoftranscript|>
 
     eval_dataloader = accelerator.prepare(eval_dataloader)
 
     if args.eval_at_init:
         model = accelerator.prepare(model)
         model = accelerator.prepare(model)
-        init_eval_metrics, init_eval_outputs = evaluation_loop(
-            model, eval_dataloader, corpus.processor, metric
+        evaluation_loop(
+            model, eval_dataloader, corpus.processor, metric, os.path.join(args.exp, "init_results.json")
         )
-        with open(os.path.join(args.exp, "init_results.json"), "w") as f:
-            json.dump({"eval_metrics": init_eval_metrics,
-                       "eval_outputs": init_eval_outputs}, f)
 
     # preparing peft model
     if args.use_peft:
@@ -336,20 +318,19 @@ def main():
         optimizer, train_dataloader, lr_scheduler
     )
 
-    accelerator.print(model)
+    #accelerator.print(model)
 
     # Note here that the max steps is adjusted by the accelerator's num_processes
     args.max_train_steps = math.ceil(args.max_train_steps / accelerator.num_processes)
 
     # We need to initialize the trackers we use, and also store our configuration.
     # The trackers initializes automatically on the main process.
-    if args.with_tracking:
-        experiment_config = vars(args)
-        # TensorBoard cannot log Enums, need the raw value
-        experiment_config["lr_scheduler_type"] = experiment_config["lr_scheduler_type"].value
-        accelerator.init_trackers(
-            "logs", config={"argv": ' '.join(sys.argv)}, init_kwargs={}
-        )
+    experiment_config = vars(args)
+    # TensorBoard cannot log Enums, need the raw value
+    experiment_config["lr_scheduler_type"] = experiment_config["lr_scheduler_type"].value
+    accelerator.init_trackers(
+        "logs", config={"argv": ' '.join(sys.argv)}, init_kwargs={}
+    )
 
     # saving and loading checkpoints for resuming training
     accelerator.register_save_state_pre_hook(save_model_hook)
@@ -363,26 +344,20 @@ def main():
     # Only show the progress bar once on each machine.
     progress_bar = tqdm(range(args.max_train_steps), disable=not accelerator.is_local_main_process)
     global_step = 0
-    starting_epoch = 0
-    best_metric = None
-    resume_step = 0
 
     # Potentially load in the weights and states from a previous save
     if args.resume_from_checkpoint:
         accelerator.load_state(args.resume_from_checkpoint)
         path = os.path.basename(args.resume_from_checkpoint)
         training_difference = os.path.splitext(path)[0]
-        global_step = resume_step = int(training_difference.replace("step_", ""))
-        starting_epoch = resume_step // len(train_dataloader)
-        resume_step -= starting_epoch * len(train_dataloader)
+        global_step = int(training_difference.replace("step_", ""))
 
     # We need to adjust the progress bar to the current step
-    progress_bar.update(resume_step)
     model.train()
-    if args.with_tracking:
-        total_loss = 0
-        running_loss = 0
-    for step, batch in enumerate(accelerator.skip_first_batches(train_dataloader, num_batches=resume_step)):
+    total_loss = 0
+    running_loss = 0
+
+    for step, batch in enumerate(train_dataloader):
         with accelerator.accumulate(model):
             outputs = model(**batch)
             loss = outputs.loss
@@ -394,47 +369,25 @@ def main():
             global_step += 1
             progress_bar.update(1)
 
-        if args.with_tracking:
-            step_loss = accelerator.reduce(loss.detach().clone()).item()
-            total_loss += step_loss
-            running_loss += step_loss
-
-        do_checkpoint, do_eval = False, False
-        if args.checkpointing_steps and global_step % args.checkpointing_steps == 0:
-            do_checkpoint = True
+        step_loss = accelerator.reduce(loss.detach().clone()).item()
+        total_loss += step_loss
+        running_loss += step_loss
 
         if global_step % args.logging_steps == 0:
-            if args.with_tracking:
-                accelerator.log({"train/running_loss": running_loss / args.logging_steps}, step=global_step)
-                logger.info(f"running loss: {running_loss / args.logging_steps}")
-                running_loss = 0
+            accelerator.log({"train/running_loss": running_loss / args.logging_steps}, step=global_step)
+            labels = batch['labels']
+            tokens = outputs.logits[:,0].argmax(-1)
+            probs = outputs.logits[:,0].softmax(dim=-1)
+            probs_ = probs.max(-1).values.detach().tolist()
+            acc = (tokens == labels).sum()
+            labels = labels.tolist()
+            tokens = tokens.tolist()
+            no_speech = 50363
+            labelprobs = probs[:,no_speech]
+            logger.info(f"running loss: {running_loss / args.logging_steps} vad accuracy: {acc} first tokens: {tokens} probs: {probs_} labels: {labels} labelprobs: {labelprobs}")
+            running_loss = 0
 
-        if args.evaluation_steps and global_step % args.evaluation_steps == 0:
-            do_eval = True
-
-        do_break = False
         if global_step >= args.max_train_steps:
-            do_checkpoint = True
-            do_eval = True
-            do_break = True
-
-        if do_checkpoint:
-            exp = os.path.join(args.exp, f"step_{global_step}")
-            accelerator.save_state(exp)
-
-        if do_eval:
-            eval_metrics, eval_outputs = evaluation_loop(
-                model, eval_dataloader, corpus.processor, metric
-            )
-            if args.with_tracking:
-                logger.info(f"Step {global_step} eval metrics: {eval_metrics}")
-                accelerator.log(eval_metrics, step=global_step)
-            if best_metric is None or eval_metrics["eval/wer"] < best_metric:
-                best_metric = eval_metrics["eval/wer"]
-                accelerator.save_state(os.path.join(args.exp, "best_checkpoint"))
-            model.train()
-
-        if do_break:
             break
 
     if not args.checkpointing_steps:
@@ -442,25 +395,17 @@ def main():
         accelerator.save_state(exp)
 
     if not args.evaluation_steps:
-        eval_metrics, eval_outputs = evaluation_loop(
-            model, eval_dataloader, corpus.processor, metric
+        eval_metrics = evaluation_loop(
+            model, eval_dataloader, corpus.processor, metric, os.path.join(args.exp, "results.json")
         )
-        if args.with_tracking:
-            logger.info(f"Step {global_step} eval metrics: {eval_metrics}")
-            accelerator.log(eval_metrics, step=global_step)
-        if best_metric is None or eval_metrics["eval/wer"] < best_metric:
-            best_metric = eval_metrics["eval/wer"]
-            accelerator.save_state(os.path.join(args.exp, "best_checkpoint"))
+        logger.info(f"Step {global_step} eval metrics: {eval_metrics}")
+        accelerator.log(eval_metrics, step=global_step)
 
     accelerator.wait_for_everyone()
     unwrapped_model = accelerator.unwrap_model(model)
     unwrapped_model.save_pretrained(args.exp, is_main_process=accelerator.is_main_process)
     if accelerator.is_main_process:
         corpus.processor.tokenizer.save_pretrained(args.exp)
-
-    with open(os.path.join(args.exp, "results.json"), "w") as f:
-        json.dump({"eval_metrics": eval_metrics,
-                   "eval_outputs": eval_outputs}, f)
 
 if __name__ == "__main__":
     main()

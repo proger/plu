@@ -21,6 +21,7 @@ from whisper.tokenizer import get_tokenizer
 )
 @click.option("as_tokens", "-k", "--tokens", is_flag=True, help="Output full tokens")
 @click.option("-s", "--allow-special", is_flag=True, help="Do not error on special tokens")
+@click.option("--num-languages", default=100, help="Number of languages in the model (large-v3 has 100. Must match your model)")
 def main(
     input,
     truncate,
@@ -30,6 +31,7 @@ def main(
     decode_tokens,
     as_tokens,
     allow_special,
+    num_languages
 ):
     """
     Convert text into whisper tokens
@@ -67,7 +69,7 @@ def main(
     if as_tokens and not decode_tokens and not encode_tokens:
         encode_tokens = True
     try:
-        tokenizer = get_tokenizer(multilingual=model == "multilingual", language=language)
+        tokenizer = get_tokenizer(multilingual=model == "multilingual", language=language, num_languages=num_languages)
         encoding = tokenizer.encoding
     except KeyError as e:
         raise click.ClickException(f"Invalid model: {model}") from e

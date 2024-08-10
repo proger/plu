@@ -18,6 +18,7 @@ parser.add_argument("-c", "--counts", type=int, default=0, help="Output token co
 parser.add_argument("-p", "--prev", type=float, default=0, help="Context inclusion probability, uses the previous input as context")
 parser.add_argument("--seed", type=int, default=0, help="Random seed")
 parser.add_argument("-r", "--resample", type=float, default=0, help="Resample the input data this many times")
+parser.add_argument("--num-languages", type=int, default=100, help="Number of languages in the model (large-v3 has 100. Must match your model)")
 
 def cdiv(x: int, y: int):
     "Ceiling division"
@@ -96,7 +97,7 @@ def main():
         input = (Example.from_text(input_line, language) for input_line in input)
 
     try:
-        tokenizer = get_tokenizer(multilingual=model == "multilingual", language=language)
+        tokenizer = get_tokenizer(multilingual=model == "multilingual", language=language, num_languages=args.num_languages)
     except KeyError as e:
         raise Exception(f"Invalid model: {model}, available: multilingual and gpt2 (see openai-whisper)") from e
     encoding = tokenizer.encoding

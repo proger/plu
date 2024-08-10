@@ -163,7 +163,10 @@ def main():
     if (args.exp / 'model.bin').exists():
         model_dir = args.exp
     else:
-        model_dir = merge_and_convert(args.exp)
+        if args.exp.exists():
+            model_dir = merge_and_convert(args.exp)
+        else:
+            model_dir = str(args.exp) # probably hub name
 
     logger.warning("if this crashes, re-run with env LD_LIBRARY_PATH=/ai/env/lib/python3.10/site-packages/nvidia/cudnn/lib")
     model = MyWhisperModel(
