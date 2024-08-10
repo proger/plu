@@ -42,15 +42,6 @@ def parse_args():
     )
     register_data_args(parser)
     parser.add_argument(
-        "--overwrite_cache", type=bool, default=False, help="Overwrite the cached training and evaluation sets"
-    )
-    parser.add_argument(
-        "--buffer_size",
-        type=int,
-        default=5000,
-        help="Number of samples to prefetch in the streaming mode.",
-    )
-    parser.add_argument(
         "--learning_rate",
         type=float,
         default=1e-4,
@@ -90,20 +81,10 @@ def parse_args():
             ' `"wandb"` and `"comet_ml"`. Use `"all"` (default) to report to all integrations.'
         ),
     )
-    parser.add_argument("--hub_token", type=str, help="The token to use to push to the Model Hub.")
-    parser.add_argument(
-        "--hub_model_id", type=str, help="The name of the repository to keep in sync with the local `exp`."
-    )
     parser.add_argument(
         "--logging_steps",
         type=int,
         default=10,
-        help="Whether the various states should be saved at the end of every n steps, or 'epoch' for each epoch.",
-    )
-    parser.add_argument(
-        "--evaluation_steps",
-        type=int,
-        default=0,
         help="Whether the various states should be saved at the end of every n steps, or 'epoch' for each epoch.",
     )
     parser.add_argument(
@@ -291,9 +272,7 @@ def main():
     if args.eval_at_init:
         model = accelerator.prepare(model)
         model = accelerator.prepare(model)
-        evaluation_loop(
-            model, eval_dataloader, corpus.processor, metric, os.path.join(args.exp, "init_results.json")
-        )
+        evaluation_loop(model, eval_dataloader, corpus.processor, metric, os.path.join(args.exp, "init_results.json"))
 
     # preparing peft model
     if args.use_peft:
@@ -390,16 +369,12 @@ def main():
         if global_step >= args.max_train_steps:
             break
 
-    if not args.checkpointing_steps:
-        exp = os.path.join(args.exp, f"step_{global_step}")
-        accelerator.save_state(exp)
+    exp = os.path.join(args.exp, f"step_{global_step}")
+    accelerator.save_state(exp)
 
-    if not args.evaluation_steps:
-        eval_metrics = evaluation_loop(
-            model, eval_dataloader, corpus.processor, metric, os.path.join(args.exp, "results.json")
-        )
-        logger.info(f"Step {global_step} eval metrics: {eval_metrics}")
-        accelerator.log(eval_metrics, step=global_step)
+    eval_metrics = evaluation_loop(model, eval_dataloader, corpus.processor, metric, os.path.join(args.exp, "results.json"))
+    logger.info(f"Step {global_step} eval metrics: {eval_metrics}")
+    accelerator.log(eval_metrics, step=global_step)
 
     accelerator.wait_for_everyone()
     unwrapped_model = accelerator.unwrap_model(model)
