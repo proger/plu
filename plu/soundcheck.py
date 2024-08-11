@@ -12,7 +12,7 @@ def check_audio_file(line):
     try:
         # Parse the JSON object from the input line
         data = json.loads(line)
-        file_path = Path('wav/' + data['path'])
+        file_path = Path(data['path'])
 
         # Check if the file exists
         if not file_path.exists():
@@ -25,8 +25,12 @@ def check_audio_file(line):
         # Try to load the audio file
         try:
             audio_data, samplerate = sf.read(file_path)
+
+            duration = len(audio_data) / samplerate
+            data["duration"] = round(duration, 2)
+            
             # File is valid, return the original JSON line
-            return (True, line.strip())
+            return (True, json.dumps(data, ensure_ascii=False))
         except Exception as e:
             return (False, f"Failed to load: {file_path} - Error: {e}")
 
