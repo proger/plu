@@ -357,12 +357,12 @@ def main():
             labels = batch['labels'][:,0]
             tokens = outputs.logits[:,0].argmax(-1)
             probs = outputs.logits[:,0].softmax(dim=-1)
-            probs_ = probs.max(-1).values.detach().tolist()
+            probs_ = [round(p, 2) for p in probs.max(-1).values.detach().tolist()]
             acc = (tokens == labels).sum()
             labels = labels.tolist()
             tokens = tokens.tolist()
             no_speech = 50363
-            labelprobs = probs[:,no_speech].detach().tolist()
+            labelprobs = [round(p, 2) for p in probs[:,no_speech].detach().tolist()]
             logger.info(f"running loss: {running_loss / args.logging_steps} vad accuracy: {acc} first tokens: {tokens} probs: {probs_} labels: {labels} labelprobs: {labelprobs}")
             running_loss = 0
 
