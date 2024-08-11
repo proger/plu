@@ -94,6 +94,8 @@ def recognize(model: MyWhisperModel, filename: Path, prefix: str | None = None):
         logger.exception("failed to recognize %s", filename)
         return
 
+    tokenizer = None
+
     for i, segment in enumerate(segments):
         start = round(segment.start, 2)
         end = round(segment.end, 2)
@@ -105,6 +107,14 @@ def recognize(model: MyWhisperModel, filename: Path, prefix: str | None = None):
             conf = None
         avg_logprob = round(segment.avg_logprob, 3)
         no_speech_prob = round(segment.no_speech_prob, 3)
+
+        if tokenizer is None or info.language != tokenizer.language:
+            tokenizer = Tokenizer(
+                model.hf_tokenizer,
+                model.model.is_multilingual,
+                task='transcribe',
+                language=info.language, # assume lid gives us this language, this only affects input_ids output
+            )
 
         prompt_ids = model.get_prompt(model.tokenizer, previous_tokens=[], without_timestamps=True, prefix=prefix)
 
