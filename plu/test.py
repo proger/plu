@@ -1,6 +1,7 @@
 import argparse
 import json
 from logging import getLogger, basicConfig
+import os
 from pathlib import Path
 import subprocess
 from faster_whisper import WhisperModel
@@ -58,11 +59,10 @@ class MyWhisperModel(WhisperModel):
             if previous_tokens:
                 prompt.extend(previous_tokens[-(self.max_length // 2 - 1) :])
 
-        #prompt.extend([tokenizer.sot, tokenizer.language, tokenizer.transcribe])
-        prompt.extend([50258, 50263, 50359])
+        prompt.extend([tokenizer.sot, tokenizer.language, tokenizer.transcribe])
 
         if without_timestamps:
-            prompt.append(50363) # tokenizer.no_timestamps
+            prompt.append(tokenizer.no_timestamps)
 
         if prefix:
             prefix_tokens = tokenizer.encode(" " + prefix.strip())
@@ -105,6 +105,9 @@ def recognize(model: MyWhisperModel, filename: Path, prefix: str | None = None):
             conf = None
         avg_logprob = round(segment.avg_logprob, 3)
         no_speech_prob = round(segment.no_speech_prob, 3)
+
+        prompt_ids = model.get_prompt(model.tokenizer, previous_tokens=[], without_timestamps=True, prefix=prefix)
+
         yield dict(
             i=i,
             start=start,
@@ -116,7 +119,7 @@ def recognize(model: MyWhisperModel, filename: Path, prefix: str | None = None):
             path=str(filename),
             language=info.language,
             langprob=round(info.language_probability, 2),
-            input_ids=segment.tokens,
+            input_ids=prompt_ids + segment.tokens,
         )
 
 
@@ -171,7 +174,9 @@ def main():
         else:
             model_dir = str(args.exp) # probably hub name
 
-    logger.warning("if this crashes, re-run with env LD_LIBRARY_PATH=/ai/env/lib/python3.10/site-packages/nvidia/cudnn/lib")
+    if os.environ.get("LD_LIBRARY_PATH", "").find("cudnn") == -1:
+        logger.warning("If this crashes, re-run with env LD_LIBRARY_PATH=/ai/env/lib/python3.10/site-packages/nvidia/cudnn/lib")
+
     model = MyWhisperModel(
         str(model_dir),
         device='cuda',
