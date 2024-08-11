@@ -86,6 +86,8 @@ def recognize(model: MyWhisperModel, filename: Path, prefix: str | None = None):
             without_timestamps=True, # our training format doesn't have timestamps
             temperature=[0.0],
             prefix=prefix,
+            log_prob_threshold=-2,
+            no_speech_threshold=0.0,
         )
     except Exception:
         logger.exception("failed to recognize %s", filename)
