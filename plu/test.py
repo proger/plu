@@ -116,7 +116,7 @@ def recognize(model: MyWhisperModel, filename: Path, prefix: str | None = None):
                 language=info.language, # assume lid gives us this language, this only affects input_ids output
             )
 
-        prompt_ids = model.get_prompt(model.tokenizer, previous_tokens=[], without_timestamps=True, prefix=prefix)
+        prompt_ids = model.get_prompt(tokenizer, previous_tokens=[], without_timestamps=True, prefix=prefix)
 
         yield dict(
             i=i,
