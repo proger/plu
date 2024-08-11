@@ -3,7 +3,6 @@ from collections import Counter, deque, defaultdict
 from dataclasses import dataclass
 import json
 import random
-import re
 import sys
 from whisper.tokenizer import get_tokenizer
 
@@ -37,18 +36,25 @@ class Example:
     language: str | None # Language code, optional
     path: str | None # Path to the audio file
     timestamp: str # Timestamp of the audio file
+    duration: float | None = None # Duration of the audio file
     input_ids: list[int] | None = None # Tokenized input (input_ids is huggingface jargon)
 
     @classmethod
     def from_json(cls, obj):
-        return cls(obj.get("receiver_location") or obj.get("source"), obj.get("text"), obj.get("language"), obj.get("path"), obj.get("timestamp"), obj.get("input_ids"))
+        return cls(obj.get("receiver_location") or obj.get("source"),
+                   obj.get("text"),
+                   obj.get("language"),
+                   obj.get("path"),
+                   obj.get("timestamp"),
+                   obj.get("duration"),
+                   obj.get("input_ids"))
 
     @classmethod
     def from_text(cls, text, language):
         if obj := json.loads(text):
             return cls.from_json(obj)
         else:
-            return cls(source=None, text=text, language=language, path=None, timestamp=None)
+            return cls(source=None, text=text, language=language, path=None, timestamp=None, duration=None, input_ids=None)
 
     def to_json(self, input_ids=None):
         return json.dumps(dict(
@@ -57,6 +63,7 @@ class Example:
             language=self.language,
             path=self.path,
             timestamp=self.timestamp,
+            duration=self.duration,
             input_ids=input_ids or self.input_ids # override
         ), ensure_ascii=False)
 
