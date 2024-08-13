@@ -76,9 +76,6 @@ class Corpus:
     def load_dataset(self, path_or_paths):
         dataset = load_dataset("json", data_files={"train": path_or_paths})["train"]
 
-        if self.args.subsample:
-            dataset = dataset.select(range(100))
-
         def resolve_paths(example):
             example["audio"] = example["path"]
             del example["path"]
@@ -151,7 +148,6 @@ def echo_loop(eval_dataloader, corpus):
 def register_data_args(parser):
     parser.add_argument("--train", type=str, nargs='+', help="jsonl filename for training data, can be multiple files", required=False)
     parser.add_argument("--eval", type=str, help="jsonl filename for evaluation data", required=True)
-    parser.add_argument("--subsample", action="store_true", help="Use a tiny fraction of data for testing")
     parser.add_argument(
         "--preprocessing_num_workers",
         type=int,

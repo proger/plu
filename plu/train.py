@@ -6,6 +6,7 @@ import logging
 import math
 import os
 import sys
+import time
 
 import datasets
 
@@ -14,10 +15,9 @@ import numpy as np
 import torch
 import transformers
 
-from accelerate import Accelerator, dispatch_model
+from accelerate import Accelerator
 from accelerate.logging import get_logger
 
-from tqdm import tqdm
 from transformers import (
     BitsAndBytesConfig,
     SchedulerType,
@@ -147,7 +147,7 @@ def evaluation_loop(model, eval_dataloader, processor, metric, output_filename):
     model.eval()
     predictions = []
     references = []
-    for _, batch in enumerate(tqdm(eval_dataloader)):
+    for _, batch in enumerate(eval_dataloader):
         with torch.cuda.amp.autocast():
             generated_tokens = (
                 model.generate(
@@ -296,6 +296,7 @@ def main():
     optimizer, train_dataloader, lr_scheduler = accelerator.prepare(
         optimizer, train_dataloader, lr_scheduler
     )
+    train_dataloader = iter(train_dataloader)
 
     #accelerator.print(model)
 
@@ -320,23 +321,32 @@ def main():
     logger.info(f"Total train batch size (w. parallel, distributed & accumulation) = {total_batch_size}")
     logger.info(f"Gradient Accumulation steps = {args.gradient_accumulation_steps}")
     logger.info(f"Total optimization steps = {args.max_train_steps}")
-    # Only show the progress bar once on each machine.
-    progress_bar = tqdm(range(args.max_train_steps), disable=not accelerator.is_local_main_process)
-    global_step = 0
+    initial_step = 0
 
     # Potentially load in the weights and states from a previous save
     if args.resume_from_checkpoint:
         accelerator.load_state(args.resume_from_checkpoint)
         path = os.path.basename(args.resume_from_checkpoint)
         training_difference = os.path.splitext(path)[0]
-        global_step = int(training_difference.replace("step_", ""))
+        initial_step = int(training_difference.replace("step_", ""))
 
-    # We need to adjust the progress bar to the current step
     model.train()
     total_loss = 0
     running_loss = 0
+    tic = time.time()
 
-    for step, batch in enumerate(train_dataloader):
+    for global_step in range(initial_step, args.max_train_steps):
+        try:
+            batch = next(train_dataloader)
+        except StopIteration:
+            logger.info("At step {global_step} the loop has reached end of dataset, resetting train dataloader.")
+            train_dataloader = corpus.make_train_dataloader(corpus.load_dataset(args.train))
+            train_dataloader = iter(accelerator.prepare(train_dataloader))
+            batch = next(train_dataloader)
+        except Exception as e:
+            logger.error(f"At step {global_step} a data error has occurred: {e}, skipping batch.")
+            continue
+
         with accelerator.accumulate(model):
             outputs = model(**batch)
             loss = outputs.loss
@@ -345,8 +355,6 @@ def main():
             lr_scheduler.step()
 
             optimizer.zero_grad()
-            global_step += 1
-            progress_bar.update(1)
 
         step_loss = accelerator.reduce(loss.detach().clone()).item()
         total_loss += step_loss
@@ -363,11 +371,11 @@ def main():
             tokens = tokens.tolist()
             no_speech = 50363
             labelprobs = [round(p, 2) for p in probs[:,no_speech].detach().tolist()]
-            logger.info(f"running loss: {running_loss / args.logging_steps} vad accuracy: {acc} first tokens: {tokens} probs: {probs_} labels: {labels} labelprobs: {labelprobs}")
+            remaining_time = (time.time() - tic) / (global_step - initial_step + 1) * (args.max_train_steps - global_step)
+            remaining_time_hh_mm_ss = time.strftime("%H:%M:%S", time.gmtime(remaining_time))
+            running_loss = round(running_loss / args.logging_steps, 3)
+            logger.info(f"At step {global_step} running loss is {running_loss}. VAD accuracy is {acc}/{len(labels)}. First tokens in the batch are {tokens}, token probabilities are {probs_}, labels are {labels}, label probabilities are {labelprobs}. Remaining time is {remaining_time_hh_mm_ss}.")
             running_loss = 0
-
-        if global_step >= args.max_train_steps:
-            break
 
     exp = os.path.join(args.exp, f"step_{global_step}")
     accelerator.save_state(exp)
