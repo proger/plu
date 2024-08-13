@@ -217,7 +217,7 @@ def main():
 
     # Make one log on every process with the configuration for debugging.
     logging.basicConfig(
-        format="%(asctime)s - %(levelname)s - %(name)s - %(message)s",
+        format="%(asctime)s - %(name)s - %(message)s",
         datefmt="%Y-%m-%dT%H:%M:%S%z",
         level=logging.INFO,
     )
@@ -364,17 +364,15 @@ def main():
             accelerator.log({"train/running_loss": running_loss / args.logging_steps}, step=global_step)
             labels = batch['labels'][:,0]
             tokens = outputs.logits[:,0].argmax(-1)
+            acc = (tokens == labels).sum()
             probs = outputs.logits[:,0].softmax(dim=-1)
             probs_ = [round(p, 2) for p in probs.max(-1).values.detach().tolist()]
-            acc = (tokens == labels).sum()
-            labels = labels.tolist()
-            tokens = tokens.tolist()
             no_speech = 50363
             labelprobs = [round(p, 2) for p in probs[:,no_speech].detach().tolist()]
             remaining_time = (time.time() - tic) / (global_step - initial_step + 1) * (args.max_train_steps - global_step)
             remaining_time_hh_mm_ss = time.strftime("%H:%M:%S", time.gmtime(remaining_time))
             running_loss = round(running_loss / args.logging_steps, 3)
-            logger.info(f"At step {global_step} running loss is {running_loss}. VAD accuracy is {acc}/{len(labels)}. First tokens in the batch are {tokens}, token probabilities are {probs_}, labels are {labels}, label probabilities are {labelprobs}. Remaining time is {remaining_time_hh_mm_ss}.")
+            logger.info(f"At step {global_step} loss is {running_loss}. First token accuracy is {acc}/{len(labels)}. Probabilities of the first token are {probs_}, <|nospeech|> probabilities are {labelprobs}. Remaining time is {remaining_time_hh_mm_ss}.")
             running_loss = 0
 
     exp = os.path.join(args.exp, f"step_{global_step}")
