@@ -12,6 +12,7 @@ parser.add_argument("-t", "--truncate", type=int, default=100, help="Truncate to
 parser.add_argument("-m", "--model", default="multilingual", help="Which model to use")
 parser.add_argument("-l", "--language", default="en", help="Assume each string is in this language for prompt generation")
 parser.add_argument("-i", "--output-ids", action="store_true", help="Output tokens as vocabulary ids")
+parser.add_argument("-k", "--output-tokens", action="store_true", help="Output raw tokens as strings")
 parser.add_argument("-q", "--quiet", action="store_true", help="Do not print any tokens, useful if you just want to count them")
 parser.add_argument("-c", "--counts", type=int, default=0, help="Output token counts as a histogram dividing length by the given number (use 10)")
 parser.add_argument("-p", "--prev", type=float, default=0, help="Context inclusion probability, uses the previous input as context")
@@ -134,8 +135,10 @@ def main():
             if not args.quiet:
                 if args.output_ids:
                     print(" ".join(str(i) for i in input_ids))
-                else:
+                elif args.output_tokens:
                     print(render_ids_as_string(input_ids))
+                else:
+                    print(example.to_json(input_ids))
 
     if count_buckets:
         print_histogram(counter)
