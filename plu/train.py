@@ -1,35 +1,37 @@
-# seeded from https://github.com/huggingface/peft/tree/main/examples
 import argparse
+import contextlib
 import gc
 import json
 import logging
 import math
 import os
-import sys
+import random
 import time
+from pathlib import Path
+from typing import Any
 
-import datasets
-
-import evaluate
 import numpy as np
 import torch
-import transformers
 
-from accelerate import Accelerator
-from accelerate.logging import get_logger
+from plu.lora import LoraConfig, apply_lora, print_trainable_parameters, save_lora_adapters
+from plu.train_data import Corpus, register_data_args
+from plu.wer import word_error_rate
+from plu.whisper_model import WhisperForConditionalGeneration, resolve_model_path
+from plu.whisper_tokenizer import WhisperTokenizer
 
-from transformers import (
-    BitsAndBytesConfig,
-    SchedulerType,
-    WhisperForConditionalGeneration,
-    get_scheduler,
-    set_seed,
-)
-from peft import LoraConfig, PeftModel, get_peft_model
 
-from plu.dataloader import Corpus, register_data_args
+logger = logging.getLogger(__name__)
 
-logger = get_logger(__name__, log_level="INFO")
+
+def str_to_bool(value: str | bool) -> bool:
+    if isinstance(value, bool):
+        return value
+    lowered = value.lower()
+    if lowered in {"1", "true", "t", "yes", "y", "on"}:
+        return True
+    if lowered in {"0", "false", "f", "no", "n", "off"}:
+        return False
+    raise argparse.ArgumentTypeError(f"invalid boolean value: {value}")
 
 
 def parse_args():
@@ -37,356 +39,343 @@ def parse_args():
     parser.add_argument(
         "--model_name_or_path",
         type=str,
-        help="Path to pretrained model or model identifier from huggingface.co/models.",
+        help="Path to a pretrained model directory or model identifier from huggingface.co/models.",
         default="openai/whisper-large-v3",
     )
     register_data_args(parser)
-    parser.add_argument(
-        "--learning_rate",
-        type=float,
-        default=1e-4,
-        help="Initial learning rate (after the potential warmup period) to use.",
-    )
+    parser.add_argument("--learning_rate", type=float, default=1e-4, help="Initial learning rate to use.")
     parser.add_argument("--weight_decay", type=float, default=1e-4, help="Weight decay to use.")
-    parser.add_argument(
-        "--max_train_steps",
-        type=int,
-        default=5000,
-        help="Total number of training steps to perform.",
-    )
+    parser.add_argument("--max_train_steps", type=int, default=5000, help="Total number of optimization steps to perform.")
     parser.add_argument(
         "--gradient_accumulation_steps",
         type=int,
         default=1,
-        help="Number of updates steps to accumulate before performing a backward/update pass.",
+        help="Number of forward/backward passes to accumulate before each optimizer update.",
     )
     parser.add_argument(
         "--lr_scheduler_type",
-        type=SchedulerType,
+        type=str,
         default="linear",
-        help="The scheduler type to use.",
         choices=["linear", "cosine", "cosine_with_restarts", "polynomial", "constant", "constant_with_warmup"],
+        help="The scheduler type to use.",
     )
-    parser.add_argument(
-        "--num_warmup_steps", type=int, default=25, help="Number of steps for the warmup in the lr scheduler."
-    )
-    parser.add_argument("--exp", type=str, default="exp/1", help="Where to store the checkpoints and the model files.")
+    parser.add_argument("--num_warmup_steps", type=int, default=25, help="Number of warmup steps for the scheduler.")
+    parser.add_argument("--exp", type=str, default="exp/1", help="Where to store checkpoints and model files.")
     parser.add_argument("--seed", type=int, default=42, help="A seed for reproducible training.")
-    parser.add_argument(
-        "--report_to",
-        type=str,
-        default="tensorboard",
-        help=(
-            'The integration to report the results and logs to. Supported platforms are `"tensorboard"`,'
-            ' `"wandb"` and `"comet_ml"`. Use `"all"` (default) to report to all integrations.'
-        ),
-    )
-    parser.add_argument(
-        "--logging_steps",
-        type=int,
-        default=10,
-        help="Whether the various states should be saved at the end of every n steps, or 'epoch' for each epoch.",
-    )
-    parser.add_argument(
-        "--resume_from_checkpoint",
-        type=str,
-        default=None,
-        help="If the training should continue from a checkpoint folder.",
-    )
+    parser.add_argument("--report_to", type=str, default="tensorboard", help="Retained for CLI compatibility; metrics are written as JSONL.")
+    parser.add_argument("--logging_steps", type=int, default=10, help="Log every n optimizer steps.")
+    parser.add_argument("--resume_from_checkpoint", type=str, default=None, help="Resume from a checkpoint directory.")
     parser.add_argument("--eval_at_init", action="store_true", help="Evaluate the model at initialization")
+    parser.add_argument("--mixed_precision", type=str, choices=["no", "fp16", "bf16"], default="fp16", help="Autocast precision.")
+    parser.add_argument("--device", type=str, default=None, help="Training device. Defaults to cuda when available, otherwise cpu.")
 
-    # lora specific args
-    parser.add_argument(
-        "--use_peft",
-        type=bool,
-        default=True,
-        help="Whether to use PEFT",
-    )
-    parser.add_argument(
-        "--lora_alpha",
-        type=int,
-        default=32,
-        help="LORA alpha",
-    )
-    parser.add_argument(
-        "--r",
-        type=int,
-        default=8,
-        help="LORA rank",
-    )
-    parser.add_argument(
-        "--lora_dropout",
-        type=float,
-        default=0.1,
-        help="LORA dropout",
-    )
+    parser.add_argument("--use_peft", type=str_to_bool, default=True, help="Whether to use LoRA adapters.")
+    parser.add_argument("--lora_alpha", type=int, default=32, help="LoRA alpha.")
+    parser.add_argument("--r", type=int, default=8, help="LoRA rank.")
+    parser.add_argument("--lora_dropout", type=float, default=0.1, help="LoRA dropout.")
 
     args = parser.parse_args()
-
     assert args.train is not None, "need a training dataset, use --train file.jsonl"
     return args
 
 
+def set_seed(seed: int) -> None:
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(seed)
 
-def save_model_hook(models, weights, exp):
-    for model in models:
-        model.save_pretrained(exp)
-        # make sure to pop weight so that corresponding model is not saved again
-        weights.pop()
+
+def move_batch(batch: dict[str, Any], device: torch.device) -> dict[str, Any]:
+    return {
+        key: value.to(device, non_blocking=True) if torch.is_tensor(value) else value
+        for key, value in batch.items()
+    }
 
 
-def load_model_hook(models, input_dir):
-    while len(models) > 0:
-        model = models.pop()
-        # pop models so that they are not loaded again
-        PeftModel.from_pretrained(model.base_model.model, input_dir)
+def autocast_context(device: torch.device, mixed_precision: str):
+    if device.type != "cuda" or mixed_precision == "no":
+        return contextlib.nullcontext()
+    dtype = torch.float16 if mixed_precision == "fp16" else torch.bfloat16
+    return torch.autocast(device_type=device.type, dtype=dtype)
+
+
+def get_lr_multiplier(name: str, step: int, warmup_steps: int, total_steps: int) -> float:
+    if name == "constant":
+        return 1.0
+    if warmup_steps > 0 and step < warmup_steps:
+        return step / max(1, warmup_steps)
+    if name == "constant_with_warmup":
+        return 1.0
+
+    progress = (step - warmup_steps) / max(1, total_steps - warmup_steps)
+    progress = min(max(progress, 0.0), 1.0)
+    if name == "linear":
+        return max(0.0, 1.0 - progress)
+    if name == "cosine":
+        return max(0.0, 0.5 * (1.0 + math.cos(math.pi * progress)))
+    if name == "cosine_with_restarts":
+        if progress >= 1.0:
+            return 0.0
+        return max(0.0, 0.5 * (1.0 + math.cos(math.pi * ((progress % 1.0)))))
+    if name == "polynomial":
+        return max(0.0, (1.0 - progress))
+    raise ValueError(f"unknown scheduler: {name}")
+
+
+def make_scheduler(optimizer: torch.optim.Optimizer, args: argparse.Namespace) -> torch.optim.lr_scheduler.LambdaLR:
+    return torch.optim.lr_scheduler.LambdaLR(
+        optimizer,
+        lambda step: get_lr_multiplier(args.lr_scheduler_type, step, args.num_warmup_steps, args.max_train_steps),
+    )
+
+
+def make_grad_scaler(device: torch.device, mixed_precision: str):
+    enabled = device.type == "cuda" and mixed_precision == "fp16"
+    if hasattr(torch, "amp") and hasattr(torch.amp, "GradScaler"):
+        return torch.amp.GradScaler("cuda", enabled=enabled)
+    return torch.cuda.amp.GradScaler(enabled=enabled)
+
+
+def save_checkpoint(
+    checkpoint_dir: str | os.PathLike[str],
+    model: torch.nn.Module,
+    optimizer: torch.optim.Optimizer,
+    scheduler: torch.optim.lr_scheduler.LambdaLR,
+    scaler: torch.cuda.amp.GradScaler,
+    step: int,
+    args: argparse.Namespace,
+) -> None:
+    path = Path(checkpoint_dir)
+    path.mkdir(parents=True, exist_ok=True)
+    torch.save(
+        {
+            "model_state_dict": model.state_dict(),
+            "optimizer_state_dict": optimizer.state_dict(),
+            "scheduler_state_dict": scheduler.state_dict(),
+            "scaler_state_dict": scaler.state_dict(),
+            "step": step,
+            "args": vars(args),
+            "torch_rng_state": torch.get_rng_state(),
+            "numpy_rng_state": np.random.get_state(),
+            "python_rng_state": random.getstate(),
+            "cuda_rng_state_all": torch.cuda.get_rng_state_all() if torch.cuda.is_available() else None,
+        },
+        path / "training_state.pt",
+    )
+
+
+def load_checkpoint(
+    checkpoint_dir: str | os.PathLike[str],
+    model: torch.nn.Module,
+    optimizer: torch.optim.Optimizer,
+    scheduler: torch.optim.lr_scheduler.LambdaLR,
+    scaler: torch.cuda.amp.GradScaler,
+    device: torch.device,
+) -> int:
+    state = torch.load(Path(checkpoint_dir) / "training_state.pt", map_location=device, weights_only=False)
+    model.load_state_dict(state["model_state_dict"])
+    optimizer.load_state_dict(state["optimizer_state_dict"])
+    scheduler.load_state_dict(state["scheduler_state_dict"])
+    scaler.load_state_dict(state.get("scaler_state_dict", {}))
+    torch.set_rng_state(state["torch_rng_state"].cpu())
+    np.random.set_state(state["numpy_rng_state"])
+    random.setstate(state["python_rng_state"])
+    if torch.cuda.is_available() and state.get("cuda_rng_state_all") is not None:
+        torch.cuda.set_rng_state_all(state["cuda_rng_state_all"])
+    return int(state.get("step", 0))
+
+
+def log_metric(exp: str, payload: dict[str, Any], step: int) -> None:
+    Path(exp).mkdir(parents=True, exist_ok=True)
+    row = {"step": step, **payload}
+    with (Path(exp) / "train_log.jsonl").open("a", encoding="utf-8") as f:
+        f.write(json.dumps(row, ensure_ascii=False) + "\n")
 
 
 @torch.no_grad()
-def evaluation_loop(model, eval_dataloader, processor, metric, output_filename):
+def evaluation_loop(
+    model: WhisperForConditionalGeneration,
+    eval_dataloader,
+    tokenizer: WhisperTokenizer,
+    device: torch.device,
+    mixed_precision: str,
+    output_filename: str,
+) -> dict[str, float]:
     model.eval()
     predictions = []
     references = []
-    for _, batch in enumerate(eval_dataloader):
-        with torch.cuda.amp.autocast():
-            generated_tokens = (
-                model.generate(
-                    input_features=batch["input_features"],
-                    max_new_tokens=255,
-                )
-                .cpu()
-                .numpy()
-            )
-            labels = batch["labels"].cpu().numpy()
-            labels = np.where(labels != -100, labels, processor.tokenizer.pad_token_id)
-            decoded_preds = processor.tokenizer.batch_decode(generated_tokens, skip_special_tokens=True)
-            decoded_labels = processor.tokenizer.batch_decode(labels, skip_special_tokens=True)
-            predictions.extend(decoded_preds)
-            references.extend(decoded_labels)
+    for batch in eval_dataloader:
+        batch = move_batch(batch, device)
+        with autocast_context(device, mixed_precision):
+            generated_tokens = model.generate(batch["input_features"], max_new_tokens=255).cpu().numpy()
+        labels = batch["labels"].detach().cpu().numpy()
+        labels = np.where(labels != -100, labels, tokenizer.pad_token_id)
+        decoded_preds = tokenizer.batch_decode(generated_tokens, skip_special_tokens=True)
+        decoded_labels = tokenizer.batch_decode(labels, skip_special_tokens=True)
+
+        for i, text in enumerate(batch.get("texts") or []):
+            if text:
+                decoded_labels[i] = text
+
+        predictions.extend(decoded_preds)
+        references.extend(decoded_labels)
         del generated_tokens, labels, batch
         gc.collect()
+
     try:
-        wer = 100 * metric.compute(predictions=predictions, references=references)
-    except:
+        wer = 100 * word_error_rate(predictions=predictions, references=references)
+    except Exception:
+        logger.exception("failed to compute WER")
         wer = 112
     eval_metrics = {"eval/wer": wer}
 
     for i, (hyp, ref) in enumerate(zip(predictions, references)):
-        print(f'{i} ref', ref, sep='\t')
-        print(f'{i} hyp', hyp, sep='\t')
+        print(f"{i} ref", ref, sep="\t")
+        print(f"{i} hyp", hyp, sep="\t")
 
-    with open(output_filename, "w") as f:
-        json.dump({"metrics": eval_metrics,
-                   "hyp": predictions,
-                   "ref": references}, f, ensure_ascii=False)
+    with open(output_filename, "w", encoding="utf-8") as f:
+        json.dump({"metrics": eval_metrics, "hyp": predictions, "ref": references}, f, ensure_ascii=False)
 
     return eval_metrics
 
 
-def load_peft(model, args):
-    from peft import prepare_model_for_kbit_training
-
-    model = prepare_model_for_kbit_training(model)
-
-    # as Whisper model uses Conv layer in encoder, checkpointing disables grad computation
-    # to avoid this, make the inputs trainable
-    def make_inputs_require_grad(module, input, output):
-        output.requires_grad_(True)
-
-    model.model.encoder.conv1.register_forward_hook(make_inputs_require_grad)
-
-    config = LoraConfig(
-        r=args.r,
-        lora_alpha=args.lora_alpha,
-        target_modules=["q_proj", "v_proj"],
-        lora_dropout=args.lora_dropout,
-    )
-
-    model = get_peft_model(model, config)
-    model.print_trainable_parameters()
-    return model
+def next_training_batch(iterator, corpus: Corpus, args: argparse.Namespace):
+    while True:
+        try:
+            return next(iterator), iterator
+        except StopIteration:
+            logger.info("training dataloader reached the end; resetting")
+            iterator = iter(corpus.make_train_dataloader(corpus.load_dataset(args.train)))
+        except Exception as exc:
+            logger.error("data error while reading a training batch: %s; skipping", exc)
 
 
 def main():
     args = parse_args()
+    logging.basicConfig(format="%(asctime)s - %(name)s - %(message)s", datefmt="%Y-%m-%dT%H:%M:%S%z", level=logging.INFO)
 
-    accelerator_kwargs = {"gradient_accumulation_steps": args.gradient_accumulation_steps}
-    accelerator_kwargs["log_with"] = args.report_to
-    accelerator_kwargs["project_dir"] = args.exp
-    accelerator = Accelerator(mixed_precision='fp16', **accelerator_kwargs)
-
-    # Make one log on every process with the configuration for debugging.
-    logging.basicConfig(
-        format="%(asctime)s - %(name)s - %(message)s",
-        datefmt="%Y-%m-%dT%H:%M:%S%z",
-        level=logging.INFO,
-    )
-    # logger.info(accelerator.state, main_process_only=False)
-    if accelerator.is_local_main_process:
-        datasets.utils.logging.set_verbosity_warning()
-        transformers.utils.logging.set_verbosity_error()
-    else:
-        datasets.utils.logging.set_verbosity_error()
-        transformers.utils.logging.set_verbosity_error()
-
-    # If passed along, set the training seed now.
     if args.seed is not None:
         set_seed(args.seed)
 
-    if accelerator.is_main_process:
-        if args.exp is not None:
-            os.makedirs(args.exp, exist_ok=True)
-    accelerator.wait_for_everyone()
+    exp_path = Path(args.exp)
+    exp_path.mkdir(parents=True, exist_ok=True)
+    device = torch.device(args.device or ("cuda" if torch.cuda.is_available() else "cpu"))
 
-    # load dataset
-    corpus = Corpus(args)
+    model_dir = resolve_model_path(args.model_name_or_path)
+    model = WhisperForConditionalGeneration.from_pretrained(model_dir)
+    tokenizer = WhisperTokenizer.from_pretrained(model_dir, pad_token_id=model.config.pad_token_id)
+    model.to(device)
+
+    corpus = Corpus(args, tokenizer=tokenizer, n_mels=model.config.num_mel_bins)
     train_dataloader = corpus.make_train_dataloader(corpus.load_dataset(args.train))
     eval_dataloader = corpus.make_eval_dataloader(corpus.load_dataset(args.eval))
 
-    # metric
-    metric = evaluate.load("wer")
-
-    # model
-    quant_config = BitsAndBytesConfig(
-        load_in_4bit=True,
-        bnb_4bit_quant_type="nf4",
-        bnb_4bit_compute_dtype=torch.float16,
-        bnb_4bit_use_double_quant=False,
-    )
-
-
-    model = WhisperForConditionalGeneration.from_pretrained(
-        args.model_name_or_path, quantization_config=quant_config,
-    )
-
-    # from openai-whisper
-    # ipdb> self.model.dims
-    # ModelDimensions(n_mels=128, n_audio_ctx=1500, n_audio_state=1280, n_audio_head=20, n_audio_layer=32, n_vocab=51866, n_text_ctx=448, n_text_state=1280, n_text_head=20, n_text_layer=32)
-
-    model.config.forced_decoder_ids = None
-    model.config.suppress_tokens = []
-    model.config.decoder_start_token_id = 50258 # <|startoftranscript|>
-
-    eval_dataloader = accelerator.prepare(eval_dataloader)
-
     if args.eval_at_init:
-        model = accelerator.prepare(model)
-        model = accelerator.prepare(model)
-        evaluation_loop(model, eval_dataloader, corpus.processor, metric, os.path.join(args.exp, "init_results.json"))
+        evaluation_loop(model, eval_dataloader, tokenizer, device, args.mixed_precision, os.path.join(args.exp, "init_results.json"))
 
-    # preparing peft model
+    lora_config = None
     if args.use_peft:
-        model = load_peft(model, args)
-        model = accelerator.prepare(model)
-    else:
-        model = accelerator.prepare(model)
+        lora_config = LoraConfig(
+            r=args.r,
+            lora_alpha=args.lora_alpha,
+            target_modules=("q_proj", "v_proj"),
+            lora_dropout=args.lora_dropout,
+        )
+        model = apply_lora(model, lora_config)
+        model.to(device)
+        logger.info(print_trainable_parameters(model))
 
-    # optimizer
-    optimizer = torch.optim.AdamW(model.parameters(), lr=args.learning_rate, weight_decay=args.weight_decay)
+    optimizer = torch.optim.AdamW((parameter for parameter in model.parameters() if parameter.requires_grad), lr=args.learning_rate, weight_decay=args.weight_decay)
+    lr_scheduler = make_scheduler(optimizer, args)
+    scaler = make_grad_scaler(device, args.mixed_precision)
 
-    # scheduler
-    lr_scheduler = get_scheduler(
-        name=args.lr_scheduler_type,
-        optimizer=optimizer,
-        num_warmup_steps=args.num_warmup_steps,
-        num_training_steps=args.max_train_steps,
-    )
-
-    # Prepare everything else with our `accelerator`.
-    optimizer, train_dataloader, lr_scheduler = accelerator.prepare(
-        optimizer, train_dataloader, lr_scheduler
-    )
-    train_dataloader = iter(train_dataloader)
-
-    #accelerator.print(model)
-
-    # Note here that the max steps is adjusted by the accelerator's num_processes
-    args.max_train_steps = math.ceil(args.max_train_steps / accelerator.num_processes)
-
-    # We need to initialize the trackers we use, and also store our configuration.
-    # The trackers initializes automatically on the main process.
-    experiment_config = vars(args)
-    # TensorBoard cannot log Enums, need the raw value
-    experiment_config["lr_scheduler_type"] = experiment_config["lr_scheduler_type"].value
-    accelerator.init_trackers(
-        "logs", config={"argv": ' '.join(sys.argv)}, init_kwargs={}
-    )
-
-    # saving and loading checkpoints for resuming training
-    accelerator.register_save_state_pre_hook(save_model_hook)
-    accelerator.register_load_state_pre_hook(load_model_hook)
-
-    total_batch_size = args.per_device_train_batch_size * accelerator.num_processes * args.gradient_accumulation_steps
-    logger.info(f"Instantaneous batch size per device = {args.per_device_train_batch_size}")
-    logger.info(f"Total train batch size (w. parallel, distributed & accumulation) = {total_batch_size}")
-    logger.info(f"Gradient Accumulation steps = {args.gradient_accumulation_steps}")
-    logger.info(f"Total optimization steps = {args.max_train_steps}")
     initial_step = 0
-
-    # Potentially load in the weights and states from a previous save
     if args.resume_from_checkpoint:
-        accelerator.load_state(args.resume_from_checkpoint)
-        path = os.path.basename(args.resume_from_checkpoint)
-        training_difference = os.path.splitext(path)[0]
-        initial_step = int(training_difference.replace("step_", ""))
+        initial_step = load_checkpoint(args.resume_from_checkpoint, model, optimizer, lr_scheduler, scaler, device)
+
+    train_iterator = iter(train_dataloader)
+    total_batch_size = args.per_device_train_batch_size * args.gradient_accumulation_steps
+    logger.info("Instantaneous batch size per device = %s", args.per_device_train_batch_size)
+    logger.info("Total train batch size with accumulation = %s", total_batch_size)
+    logger.info("Gradient accumulation steps = %s", args.gradient_accumulation_steps)
+    logger.info("Total optimization steps = %s", args.max_train_steps)
 
     model.train()
-    total_loss = 0
-    running_loss = 0
+    running_loss = 0.0
     tic = time.time()
+    global_step = initial_step
 
-    for global_step in range(initial_step, args.max_train_steps):
-        try:
-            batch = next(train_dataloader)
-        except StopIteration:
-            logger.info("At step {global_step} the loop has reached end of dataset, resetting train dataloader.")
-            train_dataloader = corpus.make_train_dataloader(corpus.load_dataset(args.train))
-            train_dataloader = iter(accelerator.prepare(train_dataloader))
-            batch = next(train_dataloader)
-        except Exception as e:
-            logger.error(f"At step {global_step} a data error has occurred: {e}, skipping batch.")
-            continue
+    while global_step < args.max_train_steps:
+        optimizer.zero_grad(set_to_none=True)
+        accumulated = 0
+        step_loss = 0.0
+        last_batch = None
+        last_outputs = None
 
-        with accelerator.accumulate(model):
-            outputs = model(**batch)
-            loss = outputs.loss
-            accelerator.backward(loss)
-            optimizer.step()
-            lr_scheduler.step()
+        while accumulated < args.gradient_accumulation_steps:
+            batch, train_iterator = next_training_batch(train_iterator, corpus, args)
+            batch = move_batch(batch, device)
+            with autocast_context(device, args.mixed_precision):
+                outputs = model(input_features=batch["input_features"], labels=batch["labels"])
+                loss = outputs.loss / args.gradient_accumulation_steps
+            if outputs.loss is None:
+                raise RuntimeError("model did not return a loss")
+            scaler.scale(loss).backward()
+            step_loss += float(outputs.loss.detach().cpu())
+            accumulated += 1
+            last_batch = batch
+            last_outputs = outputs
 
-            optimizer.zero_grad()
+        scaler.step(optimizer)
+        scaler.update()
+        lr_scheduler.step()
 
-        step_loss = accelerator.reduce(loss.detach().clone()).item()
-        total_loss += step_loss
+        step_loss /= max(1, accumulated)
         running_loss += step_loss
 
-        if global_step % args.logging_steps == 0:
-            accelerator.log({"train/running_loss": running_loss / args.logging_steps}, step=global_step)
-            labels = batch['labels'][:,0]
-            tokens = outputs.logits[:,0].argmax(-1)
-            acc = (tokens == labels).sum()
-            probs = outputs.logits[:,0].softmax(dim=-1)
-            probs_ = [round(p, 2) for p in probs.max(-1).values.detach().tolist()]
-            no_speech = 50363
-            labelprobs = [round(p, 2) for p in probs[:,no_speech].detach().tolist()]
-            remaining_time = (time.time() - tic) / (global_step - initial_step + 1) * (args.max_train_steps - global_step)
+        if global_step % args.logging_steps == 0 and last_batch is not None and last_outputs is not None:
+            labels = last_batch["labels"][:, 0]
+            tokens = last_outputs.logits[:, 0].argmax(-1)
+            acc = int((tokens == labels).sum().detach().cpu())
+            probs = last_outputs.logits[:, 0].softmax(dim=-1)
+            probs_ = [round(p, 2) for p in probs.max(-1).values.detach().cpu().tolist()]
+            no_speech = WhisperTokenizer.no_speech
+            labelprobs = [round(p, 2) for p in probs[:, no_speech].detach().cpu().tolist()] if probs.shape[-1] > no_speech else []
+            remaining_time = (time.time() - tic) / max(1, global_step - initial_step + 1) * (args.max_train_steps - global_step)
             remaining_time_hh_mm_ss = time.strftime("%H:%M:%S", time.gmtime(remaining_time))
-            running_loss = round(running_loss / args.logging_steps, 3)
-            logger.info(f"At step {global_step} loss is {running_loss}. First token accuracy is {acc}/{len(labels)}. Probabilities of the first token are {probs_}, <|nospeech|> probabilities are {labelprobs}. Remaining time is {remaining_time_hh_mm_ss}.")
-            running_loss = 0
+            average_loss = running_loss / max(1, args.logging_steps)
+            logger.info(
+                "At step %s loss is %.3f. First token accuracy is %s/%s. Probabilities of the first token are %s, <|nospeech|> probabilities are %s. Remaining time is %s.",
+                global_step,
+                average_loss,
+                acc,
+                len(labels),
+                probs_,
+                labelprobs,
+                remaining_time_hh_mm_ss,
+            )
+            log_metric(args.exp, {"train/running_loss": average_loss, "lr": lr_scheduler.get_last_lr()[0]}, global_step)
+            running_loss = 0.0
 
-    exp = os.path.join(args.exp, f"step_{global_step}")
-    accelerator.save_state(exp)
+        global_step += 1
 
-    eval_metrics = evaluation_loop(model, eval_dataloader, corpus.processor, metric, os.path.join(args.exp, "results.json"))
-    logger.info(f"Step {global_step} eval metrics: {eval_metrics}")
-    accelerator.log(eval_metrics, step=global_step)
+    checkpoint_dir = os.path.join(args.exp, f"step_{global_step}")
+    save_checkpoint(checkpoint_dir, model, optimizer, lr_scheduler, scaler, global_step, args)
 
-    accelerator.wait_for_everyone()
-    unwrapped_model = accelerator.unwrap_model(model)
-    unwrapped_model.save_pretrained(args.exp, is_main_process=accelerator.is_main_process)
-    if accelerator.is_main_process:
-        corpus.processor.tokenizer.save_pretrained(args.exp)
+    eval_metrics = evaluation_loop(model, eval_dataloader, tokenizer, device, args.mixed_precision, os.path.join(args.exp, "results.json"))
+    logger.info("Step %s eval metrics: %s", global_step, eval_metrics)
+    log_metric(args.exp, eval_metrics, global_step)
+
+    if lora_config is not None:
+        save_lora_adapters(model, args.exp, lora_config, base_model_name_or_path=args.model_name_or_path)
+        with (Path(args.exp) / "config.json").open("w", encoding="utf-8") as f:
+            json.dump(model.config.to_dict(), f, indent=2)
+    else:
+        model.save_pretrained(args.exp)
+    tokenizer.save_pretrained(args.exp)
+
 
 if __name__ == "__main__":
     main()
