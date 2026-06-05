@@ -3,7 +3,7 @@
 import click
 import re
 import sys
-from whisper.tokenizer import get_tokenizer
+from plu.tokenizer import get_tokenizer
 
 @click.command()
 @click.version_option()
@@ -14,7 +14,7 @@ from whisper.tokenizer import get_tokenizer
 @click.option("-m", "--model", default="multilingual", help="Which model to use")
 @click.option("-l", "--language", default="en", help="Prepend multilingual prompt for given language to each string")
 @click.option(
-    "encode_tokens", "--encode", "--tokens", is_flag=True, help="Output token integers"
+    "encode_tokens", "--encode", is_flag=True, help="Output token integers"
 )
 @click.option(
     "decode_tokens", "--decode", is_flag=True, help="Convert token integers to text"

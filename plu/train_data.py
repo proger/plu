@@ -14,7 +14,7 @@ import torch
 import torch.nn.functional as F
 from torch.utils.data import DataLoader, Dataset
 
-from plu.tokenizer import WhisperTokenizer
+from plu.tokenizer import SOT, WhisperTokenizer
 
 
 SAMPLE_RATE = 16000
@@ -219,7 +219,7 @@ class JsonlAudioDataset(Dataset):
 @dataclass
 class DataCollatorSpeechSeq2SeqWithPadding:
     pad_token_id: int
-    sot_token_id: int = WhisperTokenizer.sot
+    sot_token_id: int = SOT
 
     def __call__(self, features: list[dict[str, Any]]) -> dict[str, Any]:
         max_frames = max(feature["input_features"].shape[-1] for feature in features)

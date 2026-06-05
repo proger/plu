@@ -4,7 +4,7 @@ from dataclasses import dataclass
 import json
 import random
 import sys
-from whisper.tokenizer import get_tokenizer
+from plu.tokenizer import get_tokenizer
 
 parser = argparse.ArgumentParser(description="Convert sentences into whisper tokens one line at a time", formatter_class=argparse.ArgumentDefaultsHelpFormatter)
 parser.add_argument("input", type=argparse.FileType("r"), default=sys.stdin, nargs="?", help="Input file")

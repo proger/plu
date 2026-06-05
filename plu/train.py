@@ -16,7 +16,7 @@ import torch
 from plu.lora import LoraConfig, apply_lora, print_trainable_parameters, save_lora_adapters
 from plu.train_data import Corpus, register_data_args
 from plu.wer import word_error_rate
-from plu.tokenizer import WhisperTokenizer
+from plu.tokenizer import NO_SPEECH, WhisperTokenizer
 from plu.whisper import WhisperForConditionalGeneration, resolve_model_path
 
 
@@ -341,8 +341,7 @@ def main():
             acc = int((tokens == labels).sum().detach().cpu())
             probs = last_outputs.logits[:, 0].softmax(dim=-1)
             probs_ = [round(p, 2) for p in probs.max(-1).values.detach().cpu().tolist()]
-            no_speech = WhisperTokenizer.no_speech
-            labelprobs = [round(p, 2) for p in probs[:, no_speech].detach().cpu().tolist()] if probs.shape[-1] > no_speech else []
+            labelprobs = [round(p, 2) for p in probs[:, NO_SPEECH].detach().cpu().tolist()] if probs.shape[-1] > NO_SPEECH else []
             remaining_time = (time.time() - tic) / max(1, global_step - initial_step + 1) * (args.max_train_steps - global_step)
             remaining_time_hh_mm_ss = time.strftime("%H:%M:%S", time.gmtime(remaining_time))
             average_loss = running_loss / max(1, args.logging_steps)
