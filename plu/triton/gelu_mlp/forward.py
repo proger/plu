@@ -1,12 +1,13 @@
 from __future__ import annotations
 
 import torch
+import torch.nn.functional as F
 import triton
 import triton.language as tl
 from torch import Tensor
 
 from plu.ref.gelu_mlp import gelu_mlp as ref_gelu_mlp
-from plu.triton.gelu_mlp.backward import gelu_backward, linear_input_grad, linear_weight_bias_grad
+from plu.triton.gelu_mlp.backward import gelu_backward, linear_input_gelu_grad, linear_input_grad, linear_weight_bias_grad
 
 
 @triton.jit
@@ -122,7 +123,7 @@ def _gelu_mlp_forward(
         return out, preact, hidden
 
     use_large_tiles = rows >= 512 and in_features >= 512 and hidden_features >= 2048
-    block_m = 32 if use_large_tiles else 16
+    block_m = 64 if use_large_tiles else 16
     block_n = 64 if use_large_tiles else 32
     block_k = 64 if use_large_tiles else 32
     num_warps = 4
@@ -181,15 +182,62 @@ class _TritonGeluMlp(torch.autograd.Function):
     def backward(ctx, grad_out: Tensor):
         x_2d, fc1_weight, fc2_weight, preact, hidden = ctx.saved_tensors
         grad_out_2d = grad_out.contiguous().reshape(-1, fc2_weight.shape[0])
-        grad_hidden = linear_input_grad(grad_out_2d, fc2_weight)
         grad_fc2_weight, grad_fc2_bias = linear_weight_bias_grad(grad_out_2d, hidden, ctx.has_fc2_bias, dtype=fc2_weight.dtype)
-        grad_preact = gelu_backward(preact, grad_hidden)
+        grad_preact = linear_input_gelu_grad(grad_out_2d, fc2_weight, preact)
         grad_x = linear_input_grad(grad_preact, fc1_weight)
         grad_fc1_weight, grad_fc1_bias = linear_weight_bias_grad(grad_preact, x_2d, ctx.has_fc1_bias, dtype=fc1_weight.dtype)
+        return grad_x.reshape(ctx.original_x_shape), grad_fc1_weight, grad_fc1_bias, grad_fc2_weight, grad_fc2_bias
+
+
+class _TorchGemmTritonGeluMlp(torch.autograd.Function):
+    @staticmethod
+    def forward(ctx, x: Tensor, fc1_weight: Tensor, fc1_bias: Tensor | None, fc2_weight: Tensor, fc2_bias: Tensor | None):
+        original_x_shape = x.shape
+        in_features = original_x_shape[-1]
+        x_2d = x.contiguous().reshape(-1, in_features)
+        fc1_weight = fc1_weight.contiguous()
+        fc2_weight = fc2_weight.contiguous()
+        fc1_bias = None if fc1_bias is None else fc1_bias.contiguous()
+        fc2_bias = None if fc2_bias is None else fc2_bias.contiguous()
+
+        preact = F.linear(x_2d, fc1_weight.to(x_2d.dtype), None if fc1_bias is None else fc1_bias.to(x_2d.dtype))
+        hidden = F.gelu(preact)
+        out = F.linear(hidden, fc2_weight.to(hidden.dtype), None if fc2_bias is None else fc2_bias.to(hidden.dtype))
+        ctx.save_for_backward(x_2d, fc1_weight, fc2_weight, preact, hidden)
+        ctx.has_fc1_bias = fc1_bias is not None
+        ctx.has_fc2_bias = fc2_bias is not None
+        ctx.original_x_shape = original_x_shape
+        return out.reshape(*original_x_shape[:-1], fc2_weight.shape[0])
+
+    @staticmethod
+    def backward(ctx, grad_out: Tensor):
+        x_2d, fc1_weight, fc2_weight, preact, hidden = ctx.saved_tensors
+        grad_out_2d = grad_out.contiguous().reshape(-1, fc2_weight.shape[0])
+        grad_fc2_weight = grad_out_2d.t().matmul(hidden)
+        grad_fc2_bias = grad_out_2d.sum(dim=0) if ctx.has_fc2_bias else None
+        grad_hidden = grad_out_2d.matmul(fc2_weight)
+        grad_preact = gelu_backward(preact, grad_hidden)
+        grad_x = grad_preact.matmul(fc1_weight)
+        grad_fc1_weight = grad_preact.t().matmul(x_2d)
+        grad_fc1_bias = grad_preact.sum(dim=0) if ctx.has_fc1_bias else None
         return grad_x.reshape(ctx.original_x_shape), grad_fc1_weight, grad_fc1_bias, grad_fc2_weight, grad_fc2_bias
 
 
 def gelu_mlp(x: Tensor, fc1_weight: Tensor, fc1_bias: Tensor | None, fc2_weight: Tensor, fc2_bias: Tensor | None) -> Tensor:
     if not x.is_cuda:
         return ref_gelu_mlp(x, fc1_weight, fc1_bias, fc2_weight, fc2_bias)
+    in_features = x.shape[-1]
+    rows = x.numel() // in_features
+    use_torch_gemm = (
+        x.dtype == torch.float32
+        and fc1_weight.dtype == torch.float32
+        and fc2_weight.dtype == torch.float32
+        and (fc1_bias is None or fc1_bias.dtype == torch.float32)
+        and (fc2_bias is None or fc2_bias.dtype == torch.float32)
+        and rows >= 512
+        and in_features >= 512
+        and fc1_weight.shape[0] >= 2048
+    )
+    if use_torch_gemm:
+        return _TorchGemmTritonGeluMlp.apply(x, fc1_weight, fc1_bias, fc2_weight, fc2_bias)
     return _TritonGeluMlp.apply(x, fc1_weight, fc1_bias, fc2_weight, fc2_bias)

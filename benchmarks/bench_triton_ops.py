@@ -18,6 +18,19 @@ from plu.triton.lora import lora_linear as triton_lora_linear
 from plu.triton.matmul_top1 import matmul_top1 as triton_matmul_top1
 
 
+def set_tf32(enabled: bool) -> None:
+    if hasattr(torch.backends.cuda.matmul, "fp32_precision"):
+        if hasattr(torch.backends, "fp32_precision"):
+            torch.backends.fp32_precision = "tf32" if enabled else "ieee"
+        torch.backends.cuda.matmul.fp32_precision = "tf32" if enabled else "ieee"
+    else:
+        torch.backends.cuda.matmul.allow_tf32 = enabled
+        try:
+            torch.set_float32_matmul_precision("high" if enabled else "highest")
+        except AttributeError:
+            pass
+
+
 def cuda_time_ms(fn: Callable[[], None], warmup: int, iters: int) -> float:
     for _ in range(warmup):
         fn()
@@ -170,6 +183,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--vocab", type=int, default=51865)
     parser.add_argument("--rank", type=int, default=8)
     parser.add_argument("--lora-scaling", type=float, default=4.0)
+    parser.add_argument("--tf32", action="store_true", help="Enable TF32 for PyTorch reference matmuls to match large Triton tensor-core paths.")
     args = parser.parse_args()
     if args.rows is None:
         args.rows = args.batch * args.query_len
@@ -180,6 +194,7 @@ def main() -> None:
     if not torch.cuda.is_available():
         raise RuntimeError("CUDA is required for Triton benchmarks")
     args = parse_args()
+    set_tf32(args.tf32)
     torch.manual_seed(0)
     benches = {
         "flash_attention": bench_flash_attention,

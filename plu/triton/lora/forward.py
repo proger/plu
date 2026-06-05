@@ -17,6 +17,7 @@ def _lora_a_forward_kernel(
     rows: tl.constexpr,
     in_features: tl.constexpr,
     rank: tl.constexpr,
+    use_tf32: tl.constexpr,
     block_m: tl.constexpr,
     block_r: tl.constexpr,
     block_k: tl.constexpr,
@@ -38,7 +39,10 @@ def _lora_a_forward_kernel(
             mask=(offs_r[:, None] < rank) & (k[None, :] < in_features),
             other=0.0,
         )
-        acc += tl.dot(x, tl.trans(weight), input_precision="ieee")
+        if use_tf32:
+            acc += tl.dot(x, tl.trans(weight), input_precision="tf32")
+        else:
+            acc += tl.dot(x, tl.trans(weight), input_precision="ieee")
     tl.store(
         hidden_ptr + offs_m[:, None] * rank + offs_r[None, :],
         acc,
@@ -60,6 +64,7 @@ def _lora_out_forward_kernel(
     rank: tl.constexpr,
     has_bias: tl.constexpr,
     scaling: tl.constexpr,
+    use_tf32: tl.constexpr,
     block_m: tl.constexpr,
     block_o: tl.constexpr,
     block_k: tl.constexpr,
@@ -85,7 +90,10 @@ def _lora_out_forward_kernel(
             mask=(offs_o[:, None] < out_features) & (k[None, :] < in_features),
             other=0.0,
         )
-        acc += tl.dot(x, tl.trans(weight), input_precision="ieee")
+        if use_tf32:
+            acc += tl.dot(x, tl.trans(weight), input_precision="tf32")
+        else:
+            acc += tl.dot(x, tl.trans(weight), input_precision="ieee")
 
     hidden = tl.load(
         hidden_ptr + offs_m[:, None] * rank + offs_r[None, :],
@@ -126,10 +134,11 @@ def _lora_linear_forward(
     if rows == 0:
         return out, hidden
 
-    block_m = 16
-    block_k = 32
+    use_large_tiles = rows >= 512 and in_features >= 512 and out_features >= 512
+    block_m = 32 if use_large_tiles else 16
+    block_k = 64 if use_large_tiles else 32
     block_r = max(16, triton.next_power_of_2(rank))
-    block_o = 32
+    block_o = 64 if use_large_tiles else 32
     _lora_a_forward_kernel[(triton.cdiv(rows, block_m),)](
         adapter_input_2d,
         lora_a_weight,
@@ -137,6 +146,7 @@ def _lora_linear_forward(
         rows,
         in_features,
         rank,
+        use_large_tiles,
         block_m,
         block_r,
         block_k,
@@ -155,6 +165,7 @@ def _lora_linear_forward(
         rank,
         base_bias is not None,
         float(scaling),
+        use_large_tiles,
         block_m,
         block_o,
         block_k,
