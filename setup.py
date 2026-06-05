@@ -35,8 +35,9 @@ setup(
         +test=plu.test:main
         +tok=plu.tok:main
     """,
-    install_requires=["tiktoken", "openai-whisper", "soundfile", "datasets", "accelerate", "faster-whisper"],
+    install_requires=["numpy", "torch", "soundfile", "faster-whisper"],
     python_requires=">=3.8",
     include_package_data=True,
-    package_data={"plu": ["VERSION"]},
+    package_data={"plu": ["VERSION", "assets/*.npz", "assets/*.tiktoken"]},
+    license_files=["LICENSE", "THIRD_PARTY_NOTICES.md"],
 )
