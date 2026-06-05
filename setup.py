@@ -35,7 +35,7 @@ setup(
         +test=plu.test:main
         +tok=plu.tok:main
     """,
-    install_requires=["tiktoken", "openai-whisper", "soundfile", "datasets", "accelerate", "faster-whisper", "click"],
+    install_requires=["tiktoken", "openai-whisper", "soundfile", "datasets", "accelerate", "faster-whisper"],
     python_requires=">=3.8",
     include_package_data=True,
     package_data={"plu": ["VERSION"]},

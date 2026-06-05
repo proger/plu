@@ -1,87 +1,82 @@
 # based on https://github.com/simonw/ttok/tree/main/ttok
 
-import click
+import argparse
 import re
 import sys
+from pathlib import Path
+
 from plu.tokenizer import get_tokenizer
 
-@click.command()
-@click.version_option()
-@click.option("-i", "--input", "input", type=click.File("r"))
-@click.option(
-    "-t", "--truncate", "truncate", type=int, help="Truncate to this many tokens"
-)
-@click.option("-m", "--model", default="multilingual", help="Which model to use")
-@click.option("-l", "--language", default="en", help="Prepend multilingual prompt for given language to each string")
-@click.option(
-    "encode_tokens", "--encode", is_flag=True, help="Output token integers"
-)
-@click.option(
-    "decode_tokens", "--decode", is_flag=True, help="Convert token integers to text"
-)
-@click.option("as_tokens", "-k", "--tokens", is_flag=True, help="Output full tokens")
-@click.option("-s", "--allow-special", is_flag=True, help="Do not error on special tokens")
-@click.option("--num-languages", default=100, help="Number of languages in the model (large-v3 has 100. Must match your model)")
-def main(
-    input,
-    truncate,
-    model,
-    language,
-    encode_tokens,
-    decode_tokens,
-    as_tokens,
-    allow_special,
-    num_languages
-):
-    """
-    Convert text into whisper tokens
 
-    To count tokens from stdin:
+DESCRIPTION = """Convert text into whisper tokens
 
-        cat sentences.txt | wtok
+Examples:
+  cat sentences.txt | +tok
+  cat sentences.txt | +tok -t 100
+  cat sentences.txt | +tok -t 100 -m gpt2
+  cat sentences.txt | +tok --encode
+  echo 9906 1917 | +tok --decode
+  echo hello world | +tok --tokens
+"""
 
-    To truncate to 100 tokens:
 
-        cat sentences.txt | wtok -t 100
+def version() -> str:
+    return Path(__file__).with_name("VERSION").read_text(encoding="utf-8").strip()
 
-    To truncate to 100 tokens using the gpt2 model:
 
-        cat sentences.txt | wtok -t 100 -m gpt2
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(
+        description=DESCRIPTION,
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    parser.add_argument("-i", "--input", type=argparse.FileType("r"), default=sys.stdin, help="Input file")
+    parser.add_argument("-t", "--truncate", type=int, help="Truncate to this many tokens")
+    parser.add_argument("-m", "--model", default="multilingual", help="Which model to use")
+    parser.add_argument("-l", "--language", default="en", help="Prepend multilingual prompt for given language to each string")
+    parser.add_argument("--encode", dest="encode_tokens", action="store_true", help="Output token integers")
+    parser.add_argument("--decode", dest="decode_tokens", action="store_true", help="Convert token integers to text")
+    parser.add_argument("-k", "--tokens", dest="as_tokens", action="store_true", help="Output full tokens")
+    parser.add_argument("-s", "--allow-special", action="store_true", help="Do not error on special tokens")
+    parser.add_argument("--num-languages", type=int, default=100, help="Number of languages in the model (large-v3 has 100. Must match your model)")
+    parser.add_argument("--version", action="version", version=f"%(prog)s {version()}")
+    return parser.parse_args()
 
-    To view token integers:
 
-        cat sentences.txt | wtok --encode
+def fail(message: str) -> None:
+    raise SystemExit(f"Error: {message}")
 
-    To convert tokens back to text:
 
-        echo 9906 1917 | wtok --decode
+def main():
+    args = parse_args()
+    input_file = args.input
+    truncate = args.truncate
+    model = args.model
+    language = args.language
+    encode_tokens = args.encode_tokens
+    decode_tokens = args.decode_tokens
+    as_tokens = args.as_tokens
+    allow_special = args.allow_special
 
-    To see the details of the tokens:
-
-        echo hello world | wtok --tokens
-    """
     if decode_tokens and encode_tokens:
-        raise click.ClickException("Cannot use --decode with --encode")
+        fail("Cannot use --decode with --encode")
     if allow_special and not (encode_tokens or as_tokens):
-        raise click.ClickException(
-            "Cannot use --allow-special without --encode or --tokens"
-        )
+        fail("Cannot use --allow-special without --encode or --tokens")
     if as_tokens and not decode_tokens and not encode_tokens:
         encode_tokens = True
     try:
-        tokenizer = get_tokenizer(multilingual=model == "multilingual", language=language, num_languages=num_languages)
+        tokenizer = get_tokenizer(multilingual=model == "multilingual", language=language, num_languages=args.num_languages)
         encoding = tokenizer.encoding
     except KeyError as e:
-        raise click.ClickException(f"Invalid model: {model}") from e
-    for text in sys.stdin:
+        raise SystemExit(f"Error: Invalid model: {model}") from e
+    for text in input_file:
         text = text.strip()
 
         if decode_tokens:
             tokens = [int(token) for token in re.findall(r"\d+", text)]
             if as_tokens:
-                click.echo(encoding.decode_tokens_bytes(tokens))
+                print(encoding.decode_tokens_bytes(tokens))
             else:
-                click.echo(encoding.decode(tokens))
+                print(encoding.decode(tokens))
             return
 
         # Tokenize it
@@ -98,7 +93,7 @@ def main(
                     ex_str.split("\n")[0]
                     + "\n\nUse --allow-special to allow special tokens"
                 )
-            raise click.ClickException(ex_str)
+            fail(ex_str)
 
         # Prepend the prompt
         if tokens:
@@ -117,10 +112,14 @@ def main(
 
         if encode_tokens:
             if as_tokens:
-                click.echo(" ".join(wrap(t.decode('utf-8')) for t in encoding.decode_tokens_bytes(tokens)))
+                print(" ".join(wrap(t.decode('utf-8')) for t in encoding.decode_tokens_bytes(tokens)))
             else:
-                click.echo(" ".join(str(t) for t in tokens))
+                print(" ".join(str(t) for t in tokens))
         elif truncate:
-            click.echo(encoding.decode(tokens), nl=False)
+            print(encoding.decode(tokens), end="")
         else:
-            click.echo(len(tokens))
+            print(len(tokens))
+
+
+if __name__ == "__main__":
+    main()
