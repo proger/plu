@@ -3,7 +3,11 @@ from __future__ import annotations
 import argparse
 import json
 import math
+import os
+import shutil
 import subprocess
+import sys
+import urllib.request
 import wave
 from dataclasses import dataclass
 from pathlib import Path
@@ -139,21 +143,60 @@ def _mel_to_hz(mels: np.ndarray) -> np.ndarray:
 _MEL_FILTER_CACHE: dict[int, torch.Tensor] = {}
 
 
+def _mel_filter_asset_candidates() -> list[Path]:
+    filename = "mel_filters.npz"
+    candidates = []
+    if "PLU_AUDIO_ASSETS" in os.environ:
+        candidates.append(Path(os.environ["PLU_AUDIO_ASSETS"]).expanduser() / filename)
+    candidates.append(Path(__file__).resolve().parent / "assets" / filename)
+    for site_path in sys.path:
+        if site_path:
+            candidates.append(Path(site_path) / "whisper" / "assets" / filename)
+    candidates.append(Path(os.environ.get("PLU_AUDIO_CACHE", "~/.cache/plu/audio")).expanduser() / filename)
+    return candidates
+
+
+def _mel_filter_asset_path() -> Path | None:
+    candidates = _mel_filter_asset_candidates()
+    for candidate in candidates:
+        if candidate.exists():
+            return candidate
+
+    destination = candidates[-1]
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    url = "https://raw.githubusercontent.com/openai/whisper/main/whisper/assets/mel_filters.npz"
+    try:
+        with urllib.request.urlopen(url) as response, destination.open("wb") as f:
+            shutil.copyfileobj(response, f)
+        return destination
+    except OSError:
+        return None
+
+
+def _analytic_mel_filters(n_mels: int) -> torch.Tensor:
+    mel_min = _hz_to_mel(np.array([0.0]))[0]
+    mel_max = _hz_to_mel(np.array([SAMPLE_RATE / 2]))[0]
+    mel_points = np.linspace(mel_min, mel_max, n_mels + 2)
+    hz_points = _mel_to_hz(mel_points)
+    fft_frequencies = np.linspace(0, SAMPLE_RATE / 2, N_FFT // 2 + 1)
+    ramps = hz_points[:, None] - fft_frequencies[None, :]
+    fdiff = np.diff(hz_points)
+    lower = -ramps[:-2] / fdiff[:-1, None]
+    upper = ramps[2:] / fdiff[1:, None]
+    weights = np.maximum(0.0, np.minimum(lower, upper))
+    weights *= (2.0 / (hz_points[2 : n_mels + 2] - hz_points[:n_mels]))[:, None]
+    return torch.from_numpy(weights.astype(np.float32))
+
+
 def mel_filters(n_mels: int, device: torch.device) -> torch.Tensor:
     cached = _MEL_FILTER_CACHE.get(n_mels)
     if cached is None:
-        mel_min = _hz_to_mel(np.array([0.0]))[0]
-        mel_max = _hz_to_mel(np.array([SAMPLE_RATE / 2]))[0]
-        mel_points = np.linspace(mel_min, mel_max, n_mels + 2)
-        hz_points = _mel_to_hz(mel_points)
-        fft_frequencies = np.linspace(0, SAMPLE_RATE / 2, N_FFT // 2 + 1)
-        ramps = hz_points[:, None] - fft_frequencies[None, :]
-        fdiff = np.diff(hz_points)
-        lower = -ramps[:-2] / fdiff[:-1, None]
-        upper = ramps[2:] / fdiff[1:, None]
-        weights = np.maximum(0.0, np.minimum(lower, upper))
-        weights *= (2.0 / (hz_points[2 : n_mels + 2] - hz_points[:n_mels]))[:, None]
-        cached = torch.from_numpy(weights.astype(np.float32))
+        asset_path = _mel_filter_asset_path() if n_mels in {80, 128} else None
+        if asset_path is not None:
+            with np.load(asset_path, allow_pickle=False) as data:
+                cached = torch.from_numpy(data[f"mel_{n_mels}"].astype(np.float32))
+        else:
+            cached = _analytic_mel_filters(n_mels)
         _MEL_FILTER_CACHE[n_mels] = cached
     return cached.to(device)
 
@@ -253,7 +296,7 @@ class Corpus:
         self.args = args
         self.tokenizer = tokenizer
         self.n_mels = n_mels
-        self.data_collator = DataCollatorSpeechSeq2SeqWithPadding(tokenizer.pad_token_id)
+        self.data_collator = DataCollatorSpeechSeq2SeqWithPadding(tokenizer.pad_token_id, tokenizer.sot)
 
     def load_dataset(self, path_or_paths: str | list[str]) -> JsonlAudioDataset:
         dataset = JsonlAudioDataset(path_or_paths, self.n_mels)

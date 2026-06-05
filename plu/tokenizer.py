@@ -386,6 +386,7 @@ class Tokenizer:
     language: Optional[str] = None
     task: Optional[str] = None
     source_dir: Path | None = None
+    pad_token_id: int = EOT
     sot_sequence: tuple[int, ...] = ()
     special_tokens: dict[str, int] = field(default_factory=dict)
 
@@ -454,7 +455,7 @@ class Tokenizer:
             explicit_n_vocab=max([*id_to_token_bytes, *special_tokens.values(), pad_token_id, -1]) + 1,
             id_to_token_bytes=id_to_token_bytes,
         )
-        return cls(encoding=encoding, num_languages=100, source_dir=model_path)
+        return cls(encoding=encoding, num_languages=100, source_dir=model_path, pad_token_id=pad_token_id)
 
     def encode(self, text, **kwargs):
         return self.encoding.encode(text, **kwargs)
@@ -468,7 +469,7 @@ class Tokenizer:
 
     def batch_decode(self, sequences: Iterable[Iterable[int]], skip_special_tokens: bool = True) -> list[str]:
         decoded = []
-        special_ids = set(self.special_tokens.values())
+        special_ids = set(self.special_tokens.values()) | {self.pad_token_id}
         for sequence in sequences:
             token_ids = [int(token_id) for token_id in sequence]
             if skip_special_tokens:
@@ -617,4 +618,5 @@ def get_tokenizer(
         num_languages=num_languages,
         language=language,
         task=task,
+        pad_token_id=EOT if multilingual else 50256,
     )
