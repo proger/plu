@@ -1,4 +1,4 @@
-from setuptools import setup
+from setuptools import find_packages, setup
 import os
 
 def get_long_description():
@@ -25,7 +25,7 @@ setup(
     },
     license="Apache License, Version 2.0",
     version=VERSION,
-    packages=["plu"],
+    packages=find_packages(),
     entry_points="""
         [console_scripts]
         +balance=plu.balance:main

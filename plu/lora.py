@@ -8,6 +8,8 @@ from typing import Iterable
 import torch
 from torch import nn
 
+from plu.ref.lora import lora_linear
+
 
 @dataclass
 class LoraConfig:
@@ -43,9 +45,15 @@ class LoraLinear(nn.Module):
         return self.base_layer.bias
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        result = self.base_layer(x)
-        update = self.lora_B(self.lora_A(self.dropout(x))) * self.scaling
-        return result + update.to(result.dtype)
+        return lora_linear(
+            x,
+            self.dropout(x),
+            self.base_layer.weight,
+            self.base_layer.bias,
+            self.lora_A.weight,
+            self.lora_B.weight,
+            self.scaling,
+        )
 
 
 def _matches_target(full_name: str, leaf_name: str, targets: Iterable[str]) -> bool:

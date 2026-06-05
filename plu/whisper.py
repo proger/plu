@@ -13,6 +13,11 @@ import torch
 import torch.nn.functional as F
 from torch import Tensor, nn
 
+from plu.ref.cross_entropy import cross_entropy
+from plu.ref.flash_attention import flash_attention
+from plu.ref.gelu_mlp import gelu_mlp
+from plu.ref.matmul_top1 import matmul_top1
+
 
 @dataclass
 class WhisperConfig:
@@ -128,11 +133,7 @@ class WhisperAttention(nn.Module):
         key = self._shape(self.k_proj(source))
         value = self._shape(self.v_proj(source))
 
-        weights = torch.matmul(query, key.transpose(-1, -2)) * (self.head_dim ** -0.5)
-        if causal_mask is not None:
-            weights = weights + causal_mask[: weights.shape[-2], : weights.shape[-1]].to(weights.device)
-        weights = F.softmax(weights.float(), dim=-1).to(query.dtype)
-        attended = torch.matmul(weights, value)
+        attended = flash_attention(query, key, value, causal_mask)
         attended = attended.transpose(1, 2).contiguous().view(hidden_states.shape[0], hidden_states.shape[1], self.embed_dim)
         return self.out_proj(attended)
 
@@ -154,7 +155,7 @@ class WhisperEncoderLayer(nn.Module):
 
         residual = hidden_states
         hidden_states = self.final_layer_norm(hidden_states)
-        hidden_states = self.fc2(F.gelu(self.fc1(hidden_states)))
+        hidden_states = gelu_mlp(hidden_states, self.fc1.weight, self.fc1.bias, self.fc2.weight, self.fc2.bias)
         return residual + hidden_states
 
 
@@ -182,7 +183,7 @@ class WhisperDecoderLayer(nn.Module):
 
         residual = hidden_states
         hidden_states = self.final_layer_norm(hidden_states)
-        hidden_states = self.fc2(F.gelu(self.fc1(hidden_states)))
+        hidden_states = gelu_mlp(hidden_states, self.fc1.weight, self.fc1.bias, self.fc2.weight, self.fc2.bias)
         return residual + hidden_states
 
 
@@ -268,7 +269,7 @@ class WhisperForConditionalGeneration(nn.Module):
         logits = self.proj_out(decoder_hidden_states).float()
         loss = None
         if labels is not None:
-            loss = F.cross_entropy(logits.view(-1, self.config.vocab_size), labels.view(-1), ignore_index=-100)
+            loss = cross_entropy(logits, labels, ignore_index=-100)
         return Seq2SeqOutput(loss=loss, logits=logits)
 
     @torch.no_grad()
@@ -286,8 +287,7 @@ class WhisperForConditionalGeneration(nn.Module):
         finished = torch.zeros(input_features.shape[0], dtype=torch.bool, device=input_features.device)
         for _ in range(max_new_tokens):
             decoder_hidden_states = self.model.decoder(tokens, encoder_hidden_states)
-            next_token_logits = self.proj_out(decoder_hidden_states[:, -1]).float()
-            next_tokens = next_token_logits.argmax(dim=-1)
+            _, next_tokens = matmul_top1(decoder_hidden_states[:, -1], self.proj_out.weight, self.proj_out.bias)
             next_tokens = torch.where(finished, torch.full_like(next_tokens, eos_token_id), next_tokens)
             tokens = torch.cat([tokens, next_tokens[:, None]], dim=1)
             finished |= next_tokens == eos_token_id
