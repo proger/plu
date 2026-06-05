@@ -1,26 +1,72 @@
 import argparse
 import json
-from logging import getLogger, basicConfig
+from logging import getLogger
 import os
 from pathlib import Path
+import shutil
 import subprocess
+
+import torch
 from faster_whisper import WhisperModel
 from faster_whisper.tokenizer import Tokenizer
 
-from transformers import (
-    WhisperForConditionalGeneration,
-    AutoTokenizer
-)
-from peft import PeftModel
+from plu.whisper import WhisperForConditionalGeneration
 
 
 def parse_args():
-    parser = argparse.ArgumentParser(description="Merge finetuned adapter into the model, convert to CTranslate2 and do a test with faster-whisper")
+    parser = argparse.ArgumentParser(description="Merge a PLU adapter, convert to CTranslate2, and test with faster-whisper")
     parser.add_argument(
         "--exp",
         type=Path,
-        help="Path to pretrained model or model identifier from huggingface.co/models. If you pass in the ctranslate2 model directory, skips the merge step.",
-        default="exp/1",
+        help="Experiment directory. If it contains a CTranslate2 model, it is tested directly; if it contains a PLU adapter, it is merged and converted.",
+        default=Path("exp/1"),
+    )
+    parser.add_argument(
+        "--model",
+        type=str,
+        help="Skip merge/convert and test this faster-whisper alias, HF CTranslate2 model ID, or local CTranslate2 model directory.",
+        default=None,
+    )
+    parser.add_argument(
+        "--download_root",
+        type=Path,
+        help="Directory where faster-whisper should cache downloaded models.",
+        default=None,
+    )
+    parser.add_argument(
+        "--device",
+        type=str,
+        default="cuda",
+        help="Device for faster-whisper: cuda, cpu, or auto.",
+    )
+    parser.add_argument(
+        "--compute_type",
+        type=str,
+        default="float16",
+        help="CTranslate2 compute type, e.g. float16, int8_float16, int8, default.",
+    )
+    parser.add_argument(
+        "--cpu_threads",
+        type=int,
+        default=1,
+        help="CPU threads for faster-whisper.",
+    )
+    parser.add_argument(
+        "--num_workers",
+        type=int,
+        default=1,
+        help="Worker count for faster-whisper.",
+    )
+    parser.add_argument(
+        "--local_files_only",
+        action="store_true",
+        help="Only use a locally cached faster-whisper model.",
+    )
+    parser.add_argument(
+        "--quantization",
+        type=str,
+        default="float16",
+        help="CTranslate2 conversion quantization for merged PLU adapters.",
     )
     parser.add_argument(
         "filenames",
@@ -133,68 +179,153 @@ def recognize(model: MyWhisperModel, filename: Path, prefix: str | None = None):
         )
 
 
-def load_model(exp):
-    model = WhisperForConditionalGeneration.from_pretrained(exp)
-    tokenizer = AutoTokenizer.from_pretrained(exp)
-
-    peft_model = PeftModel.from_pretrained(model, exp,)
-    peft_model = peft_model.merge_and_unload()
-
-    return peft_model, tokenizer
+def _module_by_name(model, name: str):
+    modules = dict(model.named_modules())
+    try:
+        return modules[name]
+    except KeyError as exc:
+        raise KeyError(f"LoRA target module not found in base model: {name}") from exc
 
 
-def merge_and_convert(exp):
-    peft_model, tokenizer = load_model(exp)
+def merge_lora_into_base(exp: Path) -> Path:
+    adapter_config_path = exp / "adapter_config.json"
+    adapter_model_path = exp / "adapter_model.bin"
+    if not adapter_config_path.exists() or not adapter_model_path.exists():
+        raise FileNotFoundError(f"{exp} does not contain adapter_config.json and adapter_model.bin")
 
-    merged_model_dir = Path(exp) / "merged"
-    peft_model._hf_peft_config_loaded = False # wtf
-    peft_model.save_pretrained(merged_model_dir)
-    tokenizer.save_pretrained(merged_model_dir)
+    adapter_config = json.loads(adapter_config_path.read_text(encoding="utf-8"))
+    base_model = adapter_config.get("base_model_name_or_path")
+    if not base_model:
+        raise ValueError(f"{adapter_config_path} does not define base_model_name_or_path")
 
-    ct_output_dir = Path(exp) / "ct"
+    model = WhisperForConditionalGeneration.from_pretrained(base_model, map_location="cpu")
+    adapter_state = torch.load(adapter_model_path, map_location="cpu", weights_only=False)
+    scaling = float(adapter_config["lora_alpha"]) / int(adapter_config["r"])
 
-    subprocess.run(["ct2-transformers-converter",
-                    "--model", str(merged_model_dir), "--output_dir", str(ct_output_dir),
-                    "--force", "--quantization", "float16", "--copy", "tokenizer.json", "tokenizer_config.json"])
-    (ct_output_dir / "preprocessor_config.json").write_text(json.dumps({
-        "chunk_length": 30,
-        "feature_extractor_type": "WhisperFeatureExtractor",
-        "feature_size": 128, # 
-        "hop_length": 160,
-        "n_fft": 400,
-        "n_samples": 480000,
-        "nb_max_frames": 3000,
-        "padding_side": "right",
-        "padding_value": 0.0,
-        "processor_class": "WhisperProcessor",
-        "return_attention_mask": False,
-        "sampling_rate": 16000
-    }))
+    for key, lora_a in adapter_state.items():
+        if not key.endswith(".lora_A.weight"):
+            continue
+        module_name = key[: -len(".lora_A.weight")]
+        lora_b = adapter_state[f"{module_name}.lora_B.weight"]
+        module = _module_by_name(model, module_name)
+        update = torch.matmul(lora_b.to(module.weight.dtype), lora_a.to(module.weight.dtype)) * scaling
+        module.weight.data.add_(update)
 
-    return ct_output_dir
+    merged_model_dir = exp / "merged"
+    model.save_pretrained(merged_model_dir)
+    copy_tokenizer_files(exp, Path(base_model), merged_model_dir)
+    write_preprocessor_config(merged_model_dir, model.config.num_mel_bins)
+    return merged_model_dir
+
+
+def copy_tokenizer_files(exp: Path, base_model: Path, output_dir: Path) -> None:
+    output_dir.mkdir(parents=True, exist_ok=True)
+    for filename in ("tokenizer.json", "tokenizer_config.json", "special_tokens_map.json", "vocab.json", "merges.txt", "vocabulary.json"):
+        for source_dir in (exp, base_model):
+            source = source_dir / filename
+            if source.exists():
+                shutil.copy2(source, output_dir / filename)
+                break
+
+
+def write_preprocessor_config(output_dir: Path, n_mels: int) -> None:
+    (output_dir / "preprocessor_config.json").write_text(
+        json.dumps(
+            {
+                "chunk_length": 30,
+                "feature_extractor_type": "WhisperFeatureExtractor",
+                "feature_size": n_mels,
+                "hop_length": 160,
+                "n_fft": 400,
+                "n_samples": 480000,
+                "nb_max_frames": 3000,
+                "padding_side": "right",
+                "padding_value": 0.0,
+                "processor_class": "WhisperProcessor",
+                "return_attention_mask": False,
+                "sampling_rate": 16000,
+            },
+            indent=2,
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+
+
+def convert_to_ct2(model_dir: Path, output_dir: Path, quantization: str) -> Path:
+    if not (model_dir / "tokenizer.json").exists() and not (
+        (model_dir / "vocab.json").exists() and (model_dir / "merges.txt").exists()
+    ):
+        raise FileNotFoundError(
+            f"{model_dir} must contain tokenizer.json or both vocab.json and merges.txt for ct2-transformers-converter"
+        )
+
+    copy_files = [
+        filename
+        for filename in ("tokenizer.json", "tokenizer_config.json", "preprocessor_config.json", "vocab.json", "merges.txt", "vocabulary.json")
+        if (model_dir / filename).exists()
+    ]
+    cmd = [
+        "ct2-transformers-converter",
+        "--model",
+        str(model_dir),
+        "--output_dir",
+        str(output_dir),
+        "--force",
+        "--quantization",
+        quantization,
+    ]
+    if copy_files:
+        cmd.extend(["--copy_files", *copy_files])
+    subprocess.run(cmd, check=True)
+    return output_dir
+
+
+def merge_and_convert(exp: Path, quantization: str) -> Path:
+    ct_output_dir = exp / "ct"
+    if (ct_output_dir / "model.bin").exists():
+        return ct_output_dir
+    merged_model_dir = merge_lora_into_base(exp)
+    return convert_to_ct2(merged_model_dir, ct_output_dir, quantization)
+
+
+def resolve_model_arg(args) -> str:
+    if args.model is not None:
+        return args.model
+    if (args.exp / "model.bin").exists():
+        return str(args.exp)
+    if args.exp.exists():
+        return str(merge_and_convert(args.exp, args.quantization))
+    return str(args.exp)
 
 
 def main():
     args = parse_args()
-    if (args.exp / 'model.bin').exists():
-        model_dir = args.exp
-    else:
-        if args.exp.exists():
-            model_dir = merge_and_convert(args.exp)
-        else:
-            model_dir = str(args.exp) # probably hub name
+    model_name_or_path = resolve_model_arg(args)
 
-    if os.environ.get("LD_LIBRARY_PATH", "").find("cudnn") == -1:
+    if Path(model_name_or_path).exists() and not (Path(model_name_or_path) / "model.bin").exists():
+        raise ValueError(
+            f"{model_name_or_path} exists but is not a faster-whisper/CTranslate2 model directory. "
+            "Convert or merge training outputs separately, then pass the converted directory."
+        )
+
+    if args.device == "cuda" and os.environ.get("LD_LIBRARY_PATH", "").find("cudnn") == -1:
         logger.warning("If this crashes, re-run with env LD_LIBRARY_PATH=/ai/env/lib/python3.10/site-packages/nvidia/cudnn/lib")
 
     model = MyWhisperModel(
-        str(model_dir),
-        device='cuda',
-        compute_type='float16',
-        num_workers=1,
-        cpu_threads=1,
+        model_name_or_path,
+        device=args.device,
+        compute_type=args.compute_type,
+        num_workers=args.num_workers,
+        cpu_threads=args.cpu_threads,
+        download_root=str(args.download_root) if args.download_root is not None else None,
+        local_files_only=args.local_files_only,
     )
 
     for filename in args.filenames:
         for seg in recognize(model, filename):
             print(json.dumps(seg, ensure_ascii=False))
+
+
+if __name__ == "__main__":
+    main()
