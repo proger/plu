@@ -10,13 +10,32 @@ from pathlib import Path
 from typing import Any
 
 import torch
-import torch.nn.functional as F
 from torch import Tensor, nn
 
-from plu.ref.cross_entropy import cross_entropy
-from plu.ref.flash_attention import flash_attention
-from plu.ref.gelu_mlp import gelu_mlp
-from plu.ref.matmul_top1 import matmul_top1
+if os.environ.get("PLU_OPS_BACKEND", "").lower() == "ref":
+    from plu.ref.c_proj import c_proj
+    from plu.ref.conv1d_gelu import conv1d_gelu
+    from plu.ref.cross_entropy import cross_entropy
+    from plu.ref.embedding import decoder_embedding, encoder_position_embedding
+    from plu.ref.flash_attention import flash_attention
+    from plu.ref.gelu_mlp import gelu_mlp
+    from plu.ref.layer_norm import layer_norm
+    from plu.ref.linear import linear
+    from plu.ref.matmul_top1 import matmul_top1
+    from plu.ref.qkv_proj import qkv_proj
+    from plu.ref.residual_add import residual_add
+else:
+    from plu.triton.cross_entropy import cross_entropy
+    from plu.triton.flash_attention import flash_attention
+    from plu.triton.gelu_mlp import gelu_mlp
+    from plu.triton.matmul_top1 import matmul_top1
+    from plu.triton.c_proj import c_proj
+    from plu.triton.conv1d_gelu import conv1d_gelu
+    from plu.triton.embedding import decoder_embedding, encoder_position_embedding
+    from plu.triton.layer_norm import layer_norm
+    from plu.triton.linear import linear
+    from plu.triton.qkv_proj import qkv_proj
+    from plu.triton.residual_add import residual_add
 
 
 @dataclass
@@ -88,7 +107,7 @@ class Seq2SeqOutput:
 
 class CastLinear(nn.Linear):
     def forward(self, x: Tensor) -> Tensor:
-        return F.linear(x, self.weight.to(x.dtype), None if self.bias is None else self.bias.to(x.dtype))
+        return linear(x, self.weight, self.bias)
 
 
 class CastConv1d(nn.Conv1d):
@@ -98,7 +117,7 @@ class CastConv1d(nn.Conv1d):
 
 class CastLayerNorm(nn.LayerNorm):
     def forward(self, x: Tensor) -> Tensor:
-        return super().forward(x.float()).to(x.dtype)
+        return layer_norm(x, self.weight, self.bias, self.eps)
 
 
 def sinusoids(length: int, channels: int, max_timescale: int = 10000) -> Tensor:
@@ -123,19 +142,14 @@ class WhisperAttention(nn.Module):
         self.v_proj = CastLinear(embed_dim, embed_dim)
         self.out_proj = CastLinear(embed_dim, embed_dim)
 
-    def _shape(self, tensor: Tensor) -> Tensor:
-        batch, seq_len, _ = tensor.shape
-        return tensor.view(batch, seq_len, self.num_heads, self.head_dim).transpose(1, 2)
-
     def forward(self, hidden_states: Tensor, key_value_states: Tensor | None = None, causal_mask: Tensor | None = None) -> Tensor:
-        query = self._shape(self.q_proj(hidden_states))
         source = hidden_states if key_value_states is None else key_value_states
-        key = self._shape(self.k_proj(source))
-        value = self._shape(self.v_proj(source))
+        query = qkv_proj(hidden_states, self.q_proj.weight, self.q_proj.bias, self.num_heads)
+        key = qkv_proj(source, self.k_proj.weight, self.k_proj.bias, self.num_heads)
+        value = qkv_proj(source, self.v_proj.weight, self.v_proj.bias, self.num_heads)
 
         attended = flash_attention(query, key, value, causal_mask)
-        attended = attended.transpose(1, 2).contiguous().view(hidden_states.shape[0], hidden_states.shape[1], self.embed_dim)
-        return self.out_proj(attended)
+        return c_proj(attended, self.out_proj.weight, self.out_proj.bias)
 
 
 class WhisperEncoderLayer(nn.Module):
@@ -151,12 +165,12 @@ class WhisperEncoderLayer(nn.Module):
         residual = hidden_states
         hidden_states = self.self_attn_layer_norm(hidden_states)
         hidden_states = self.self_attn(hidden_states)
-        hidden_states = residual + hidden_states
+        hidden_states = residual_add(residual, hidden_states)
 
         residual = hidden_states
         hidden_states = self.final_layer_norm(hidden_states)
         hidden_states = gelu_mlp(hidden_states, self.fc1.weight, self.fc1.bias, self.fc2.weight, self.fc2.bias)
-        return residual + hidden_states
+        return residual_add(residual, hidden_states)
 
 
 class WhisperDecoderLayer(nn.Module):
@@ -174,17 +188,17 @@ class WhisperDecoderLayer(nn.Module):
         residual = hidden_states
         hidden_states = self.self_attn_layer_norm(hidden_states)
         hidden_states = self.self_attn(hidden_states, causal_mask=causal_mask)
-        hidden_states = residual + hidden_states
+        hidden_states = residual_add(residual, hidden_states)
 
         residual = hidden_states
         hidden_states = self.encoder_attn_layer_norm(hidden_states)
         hidden_states = self.encoder_attn(hidden_states, key_value_states=encoder_hidden_states)
-        hidden_states = residual + hidden_states
+        hidden_states = residual_add(residual, hidden_states)
 
         residual = hidden_states
         hidden_states = self.final_layer_norm(hidden_states)
         hidden_states = gelu_mlp(hidden_states, self.fc1.weight, self.fc1.bias, self.fc2.weight, self.fc2.bias)
-        return residual + hidden_states
+        return residual_add(residual, hidden_states)
 
 
 class WhisperEncoder(nn.Module):
@@ -201,13 +215,12 @@ class WhisperEncoder(nn.Module):
         self.layer_norm = CastLayerNorm(config.d_model)
 
     def forward(self, input_features: Tensor) -> Tensor:
-        hidden_states = F.gelu(self.conv1(input_features))
-        hidden_states = F.gelu(self.conv2(hidden_states))
+        hidden_states = conv1d_gelu(input_features, self.conv1.weight, self.conv1.bias, self.conv1.stride[0], self.conv1.padding[0])
+        hidden_states = conv1d_gelu(hidden_states, self.conv2.weight, self.conv2.bias, self.conv2.stride[0], self.conv2.padding[0])
         hidden_states = hidden_states.transpose(1, 2)
         if hidden_states.shape[1] > self.config.max_source_positions:
             raise ValueError(f"input features are too long: {hidden_states.shape[1]} > {self.config.max_source_positions}")
-        positions = torch.arange(hidden_states.shape[1], device=hidden_states.device)
-        hidden_states = hidden_states + self.embed_positions(positions).to(hidden_states.dtype)
+        hidden_states = encoder_position_embedding(hidden_states, self.embed_positions.weight)
         for layer in self.layers:
             hidden_states = layer(hidden_states)
         return self.layer_norm(hidden_states)
@@ -227,9 +240,7 @@ class WhisperDecoder(nn.Module):
     def forward(self, input_ids: Tensor, encoder_hidden_states: Tensor) -> Tensor:
         if input_ids.shape[1] > self.config.max_target_positions:
             input_ids = input_ids[:, -self.config.max_target_positions :]
-        positions = torch.arange(input_ids.shape[1], device=input_ids.device)
-        hidden_states = self.embed_tokens(input_ids) + self.embed_positions(positions)
-        hidden_states = hidden_states.to(encoder_hidden_states.dtype)
+        hidden_states = decoder_embedding(input_ids, self.embed_tokens.weight, self.embed_positions.weight, encoder_hidden_states.dtype)
         for layer in self.layers:
             hidden_states = layer(hidden_states, encoder_hidden_states, self.causal_mask)
         return self.layer_norm(hidden_states)

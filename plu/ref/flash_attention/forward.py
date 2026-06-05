@@ -12,4 +12,3 @@ def flash_attention(query: Tensor, key: Tensor, value: Tensor, causal_mask: Tens
         weights = weights + causal_mask[: weights.shape[-2], : weights.shape[-1]].to(weights.device)
     weights = F.softmax(weights.float(), dim=-1).to(query.dtype)
     return torch.matmul(weights, value)
-

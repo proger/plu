@@ -5,7 +5,6 @@ import triton
 import triton.language as tl
 from torch import Tensor
 
-from plu.ref.flash_attention import flash_attention as ref_flash_attention
 from plu.triton.flash_attention.backward import flash_attention_backward
 
 
@@ -134,9 +133,8 @@ class _TritonFlashAttention(torch.autograd.Function):
 
 def flash_attention(query: Tensor, key: Tensor, value: Tensor, causal_mask: Tensor | None = None) -> Tensor:
     if not query.is_cuda:
-        return ref_flash_attention(query, key, value, causal_mask)
+        raise RuntimeError("plu.triton.flash_attention requires CUDA tensors")
     if query.shape[-1] > 128:
-        return ref_flash_attention(query, key, value, causal_mask)
+        raise RuntimeError("plu.triton.flash_attention supports head_dim <= 128")
     causal = causal_mask is not None
     return _TritonFlashAttention.apply(query, key, value, causal)
-

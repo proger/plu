@@ -5,7 +5,6 @@ import triton
 import triton.language as tl
 from torch import Tensor
 
-from plu.ref.cross_entropy import cross_entropy as ref_cross_entropy
 from plu.triton.cross_entropy.backward import cross_entropy_backward, cross_entropy_large_backward
 
 
@@ -227,7 +226,7 @@ class _TritonCrossEntropyLarge(torch.autograd.Function):
 
 def cross_entropy(logits: Tensor, labels: Tensor, ignore_index: int = -100) -> Tensor:
     if not logits.is_cuda:
-        return ref_cross_entropy(logits, labels, ignore_index=ignore_index)
+        raise RuntimeError("plu.triton.cross_entropy requires CUDA tensors")
     if logits.shape[-1] > 8192:
         return _TritonCrossEntropyLarge.apply(logits, labels, ignore_index, 1024)
     return _TritonCrossEntropy.apply(logits, labels, ignore_index)

@@ -8,7 +8,10 @@ from typing import Iterable
 import torch
 from torch import nn
 
-from plu.ref.lora import lora_linear
+try:
+    from plu.triton.lora import lora_linear
+except ImportError:
+    from plu.ref.lora import lora_linear
 
 
 @dataclass

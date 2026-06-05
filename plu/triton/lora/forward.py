@@ -5,7 +5,6 @@ import triton
 import triton.language as tl
 from torch import Tensor
 
-from plu.ref.lora import lora_linear as ref_lora_linear
 from plu.triton.lora.backward import lora_linear_backward
 
 
@@ -239,5 +238,5 @@ def lora_linear(
     scaling: float,
 ) -> Tensor:
     if not x.is_cuda:
-        return ref_lora_linear(x, adapter_input, base_weight, base_bias, lora_a_weight, lora_b_weight, scaling)
+        raise RuntimeError("plu.triton.lora_linear requires CUDA tensors")
     return _TritonLoraLinear.apply(x, adapter_input, base_weight, base_bias, lora_a_weight, lora_b_weight, scaling)

@@ -248,10 +248,10 @@ def linear_input_grad(grad_out: Tensor, weight: Tensor) -> Tensor:
     grad_input = torch.empty((rows, in_features), device=grad_out.device, dtype=grad_out.dtype)
     if rows == 0:
         return grad_input
-    use_large_tiles = rows >= 512 and out_features >= 512 and in_features >= 512
+    use_large_tiles = rows >= 512 and out_features >= 512 and in_features >= 256
     block_m = 64 if use_large_tiles else 16
-    block_k = 64 if use_large_tiles else 32
-    block_n = 64 if use_large_tiles else 32
+    block_k = 128 if use_large_tiles else 32
+    block_n = 32 if use_large_tiles else 32
     _linear_input_grad_kernel[(triton.cdiv(rows, block_m), triton.cdiv(in_features, block_k))](
         grad_out,
         weight,
@@ -274,10 +274,10 @@ def linear_input_gelu_grad(grad_out: Tensor, weight: Tensor, preact: Tensor) -> 
     grad_input = torch.empty((rows, in_features), device=grad_out.device, dtype=grad_out.dtype)
     if rows == 0:
         return grad_input
-    use_large_tiles = rows >= 512 and out_features >= 512 and in_features >= 512
+    use_large_tiles = rows >= 512 and out_features >= 512 and in_features >= 256
     block_m = 64 if use_large_tiles else 16
-    block_k = 64 if use_large_tiles else 32
-    block_n = 64 if use_large_tiles else 32
+    block_k = 128 if use_large_tiles else 32
+    block_n = 32 if use_large_tiles else 32
     _linear_input_gelu_grad_kernel[(triton.cdiv(rows, block_m), triton.cdiv(in_features, block_k))](
         grad_out,
         weight,
@@ -299,15 +299,19 @@ def linear_weight_bias_grad(grad_out: Tensor, x: Tensor, has_bias: bool, dtype: 
     rows, out_features = grad_out.shape
     in_features = x.shape[1]
     grad_dtype = grad_out.dtype if dtype is None else dtype
-    grad_weight = torch.zeros((out_features, in_features), device=grad_out.device, dtype=grad_dtype)
+    use_large_tiles = rows >= 512 and out_features >= 512 and in_features >= 256
+    if use_large_tiles:
+        grad_weight = torch.empty((out_features, in_features), device=grad_out.device, dtype=grad_dtype)
+    else:
+        grad_weight = torch.zeros((out_features, in_features), device=grad_out.device, dtype=grad_dtype)
     grad_bias = torch.zeros(out_features, device=grad_out.device, dtype=grad_dtype) if has_bias else None
     if rows == 0:
+        grad_weight.zero_()
         return grad_weight, grad_bias
 
-    use_large_tiles = rows >= 512 and out_features >= 512 and in_features >= 512
     block_n = 64 if use_large_tiles else 32
-    block_k = 64 if use_large_tiles else 32
-    block_m = 64 if use_large_tiles else 32
+    block_k = 128 if use_large_tiles else 32
+    block_m = 16 if use_large_tiles else 32
     if use_large_tiles:
         _linear_weight_grad_reduce_kernel[(triton.cdiv(out_features, block_n), triton.cdiv(in_features, block_k))](
             grad_out,

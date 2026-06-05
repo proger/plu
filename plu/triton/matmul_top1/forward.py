@@ -1,12 +1,10 @@
 from __future__ import annotations
 
 import torch
-import torch.nn.functional as F
 import triton
 import triton.language as tl
 from torch import Tensor
 
-from plu.ref.matmul_top1 import matmul_top1 as ref_matmul_top1
 from plu.triton.matmul_top1.backward import matmul_top1_backward
 
 
@@ -131,9 +129,9 @@ def _matmul_top1_forward(x_2d: Tensor, weight: Tensor, bias: Tensor | None) -> t
         return values, indices
 
     use_tiled = rows >= 16 and in_features >= 512 and out_features >= 512
-    block_m = 32 if use_tiled else 16
+    block_m = 64 if use_tiled else 16
     block_v = 128
-    block_k = 64 if use_tiled else triton.next_power_of_2(in_features)
+    block_k = 32 if use_tiled else triton.next_power_of_2(in_features)
     num_out_blocks = triton.cdiv(out_features, block_v)
     partial_values = torch.empty((rows, num_out_blocks), device=x_2d.device, dtype=torch.float32)
     partial_indices = torch.empty((rows, num_out_blocks), device=x_2d.device, dtype=torch.int64)
@@ -210,47 +208,7 @@ class _TritonMatmulTop1(torch.autograd.Function):
         return dx.reshape(ctx.original_x_shape), dweight, dbias
 
 
-class _TorchForwardTritonBackwardMatmulTop1(torch.autograd.Function):
-    @staticmethod
-    def forward(ctx, x: Tensor, weight: Tensor, bias: Tensor | None):
-        original_x_shape = x.shape
-        in_features = original_x_shape[-1]
-        x_2d = x.contiguous().reshape(-1, in_features)
-        weight_contiguous = weight.contiguous()
-        bias_contiguous = None if bias is None else bias.contiguous()
-        logits = F.linear(x_2d, weight_contiguous, bias_contiguous)
-        values, indices = logits.max(dim=-1)
-        ctx.save_for_backward(x_2d, weight_contiguous, indices)
-        ctx.has_bias = bias is not None
-        ctx.original_x_shape = original_x_shape
-        return values.reshape(original_x_shape[:-1]), indices.reshape(original_x_shape[:-1])
-
-    @staticmethod
-    def backward(ctx, grad_values: Tensor, grad_indices: Tensor | None):
-        x_2d, weight, indices = ctx.saved_tensors
-        dx, dweight, dbias = matmul_top1_backward(
-            x_2d,
-            weight,
-            indices.reshape(-1),
-            grad_values.contiguous().reshape(-1),
-            ctx.has_bias,
-        )
-        return dx.reshape(ctx.original_x_shape), dweight, dbias
-
-
 def matmul_top1(x: Tensor, weight: Tensor, bias: Tensor | None = None) -> tuple[Tensor, Tensor]:
     if not x.is_cuda:
-        return ref_matmul_top1(x, weight, bias)
-    in_features = x.shape[-1]
-    rows = x.numel() // in_features
-    use_torch_forward = (
-        rows >= 16
-        and in_features >= 512
-        and weight.shape[0] >= 512
-        and x.dtype == torch.float32
-        and weight.dtype == torch.float32
-        and (bias is None or bias.dtype == torch.float32)
-    )
-    if use_torch_forward:
-        return _TorchForwardTritonBackwardMatmulTop1.apply(x, weight, bias)
+        raise RuntimeError("plu.triton.matmul_top1 requires CUDA tensors")
     return _TritonMatmulTop1.apply(x, weight, bias)
