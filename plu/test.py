@@ -69,6 +69,12 @@ def parse_args():
         help="CTranslate2 conversion quantization for merged PLU adapters.",
     )
     parser.add_argument(
+        "--language",
+        type=str,
+        default=None,
+        help="Optional language code to pass to faster-whisper; skips language detection when set.",
+    )
+    parser.add_argument(
         "filenames",
         type=Path,
         nargs="*",
@@ -122,7 +128,7 @@ class MyWhisperModel(WhisperModel):
 
 
 
-def recognize(model: MyWhisperModel, filename: Path, prefix: str | None = None):
+def recognize(model: MyWhisperModel, filename: Path, prefix: str | None = None, language: str | None = None):
     logger.debug("recognize %s", filename)
     try:
         segments, info = model.transcribe(
@@ -132,6 +138,7 @@ def recognize(model: MyWhisperModel, filename: Path, prefix: str | None = None):
             without_timestamps=True, # our training format doesn't have timestamps
             temperature=[0.0],
             prefix=prefix,
+            language=language,
             log_prob_threshold=None,
             no_speech_threshold=None,
             compression_ratio_threshold=None,
@@ -323,7 +330,7 @@ def main():
     )
 
     for filename in args.filenames:
-        for seg in recognize(model, filename):
+        for seg in recognize(model, filename, language=args.language):
             print(json.dumps(seg, ensure_ascii=False))
 
 
