@@ -107,7 +107,7 @@ def main():
     try:
         tokenizer = get_tokenizer(multilingual=model == "multilingual", language=language, num_languages=args.num_languages)
     except KeyError as e:
-        raise Exception(f"Invalid model: {model}, available: multilingual and gpt2 (see openai-whisper)") from e
+        raise Exception(f"Invalid model: {model}, available: multilingual and gpt2") from e
     encoding = tokenizer.encoding
 
     def render_ids_as_string(input_ids):

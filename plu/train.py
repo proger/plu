@@ -69,7 +69,7 @@ def parse_args():
     parser.add_argument("--mixed_precision", type=str, choices=["no", "fp16", "bf16"], default="fp16", help="Autocast precision.")
     parser.add_argument("--device", type=str, default=None, help="Training device. Defaults to cuda when available, otherwise cpu.")
 
-    parser.add_argument("--use_peft", type=str_to_bool, default=True, help="Whether to use LoRA adapters.")
+    parser.add_argument("--use_lora", type=str_to_bool, default=True, help="Whether to use LoRA adapters.")
     parser.add_argument("--lora_alpha", type=int, default=32, help="LoRA alpha.")
     parser.add_argument("--r", type=int, default=8, help="LoRA rank.")
     parser.add_argument("--lora_dropout", type=float, default=0.1, help="LoRA dropout.")
@@ -276,7 +276,7 @@ def main():
         evaluation_loop(model, eval_dataloader, tokenizer, device, args.mixed_precision, os.path.join(args.exp, "init_results.json"))
 
     lora_config = None
-    if args.use_peft:
+    if args.use_lora:
         lora_config = LoraConfig(
             r=args.r,
             lora_alpha=args.lora_alpha,

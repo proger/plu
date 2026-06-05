@@ -101,7 +101,6 @@ def save_lora_adapters(model: nn.Module, output_dir: str | Path, config: LoraCon
     output_path.mkdir(parents=True, exist_ok=True)
     torch.save(lora_state_dict(model), output_path / "adapter_model.bin")
     payload = {
-        "peft_type": "LORA",
         "r": config.r,
         "lora_alpha": config.lora_alpha,
         "lora_dropout": config.lora_dropout,
