@@ -10,7 +10,6 @@ import time
 from pathlib import Path
 from typing import Any
 
-import numpy as np
 import torch
 
 from plu.lora import LoraConfig, apply_lora, print_trainable_parameters, save_lora_adapters
@@ -81,7 +80,6 @@ def parse_args():
 
 def set_seed(seed: int) -> None:
     random.seed(seed)
-    np.random.seed(seed)
     torch.manual_seed(seed)
     if torch.cuda.is_available():
         torch.cuda.manual_seed_all(seed)
@@ -158,7 +156,6 @@ def save_checkpoint(
             "step": step,
             "args": vars(args),
             "torch_rng_state": torch.get_rng_state(),
-            "numpy_rng_state": np.random.get_state(),
             "python_rng_state": random.getstate(),
             "cuda_rng_state_all": torch.cuda.get_rng_state_all() if torch.cuda.is_available() else None,
         },
@@ -180,7 +177,6 @@ def load_checkpoint(
     scheduler.load_state_dict(state["scheduler_state_dict"])
     scaler.load_state_dict(state.get("scaler_state_dict", {}))
     torch.set_rng_state(state["torch_rng_state"].cpu())
-    np.random.set_state(state["numpy_rng_state"])
     random.setstate(state["python_rng_state"])
     if torch.cuda.is_available() and state.get("cuda_rng_state_all") is not None:
         torch.cuda.set_rng_state_all(state["cuda_rng_state_all"])
@@ -209,9 +205,9 @@ def evaluation_loop(
     for batch in eval_dataloader:
         batch = move_batch(batch, device)
         with autocast_context(device, mixed_precision):
-            generated_tokens = model.generate(batch["input_features"], max_new_tokens=255).cpu().numpy()
-        labels = batch["labels"].detach().cpu().numpy()
-        labels = np.where(labels != -100, labels, tokenizer.pad_token_id)
+            generated_tokens = model.generate(batch["input_features"], max_new_tokens=255).cpu()
+        labels = batch["labels"].detach().cpu()
+        labels = labels.masked_fill(labels.eq(-100), tokenizer.pad_token_id)
         decoded_preds = tokenizer.batch_decode(generated_tokens, skip_special_tokens=True)
         decoded_labels = tokenizer.batch_decode(labels, skip_special_tokens=True)
 

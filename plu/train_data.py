@@ -1,19 +1,21 @@
 from __future__ import annotations
 
 import argparse
+import ast
 import json
 import math
 import os
 import shutil
 import subprocess
+import struct
 import sys
 import urllib.request
 import wave
+import zipfile
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
-import numpy as np
 import torch
 import torch.nn.functional as F
 from torch.utils.data import DataLoader, Dataset
@@ -40,31 +42,31 @@ def str_to_bool(value: str | bool) -> bool:
     raise argparse.ArgumentTypeError(f"invalid boolean value: {value}")
 
 
-def _decode_pcm(raw: bytes, sample_width: int) -> np.ndarray:
+def _decode_pcm(raw: bytes, sample_width: int) -> torch.Tensor:
     if sample_width == 1:
-        return (np.frombuffer(raw, dtype=np.uint8).astype(np.float32) - 128.0) / 128.0
+        return (torch.frombuffer(bytearray(raw), dtype=torch.uint8).float() - 128.0) / 128.0
     if sample_width == 2:
-        return np.frombuffer(raw, dtype="<i2").astype(np.float32) / 32768.0
+        return torch.frombuffer(bytearray(raw), dtype=torch.int16).float() / 32768.0
     if sample_width == 3:
-        data = np.frombuffer(raw, dtype=np.uint8).reshape(-1, 3)
-        values = data[:, 0].astype(np.int32) | (data[:, 1].astype(np.int32) << 8) | (data[:, 2].astype(np.int32) << 16)
-        values = np.where(values & 0x800000, values | ~0xFFFFFF, values)
-        return values.astype(np.float32) / 8388608.0
+        data = torch.frombuffer(bytearray(raw), dtype=torch.uint8).view(-1, 3).int()
+        values = data[:, 0] | (data[:, 1] << 8) | (data[:, 2] << 16)
+        values = torch.where((values & 0x800000).ne(0), values | ~0xFFFFFF, values)
+        return values.float() / 8388608.0
     if sample_width == 4:
-        return np.frombuffer(raw, dtype="<i4").astype(np.float32) / 2147483648.0
+        return torch.frombuffer(bytearray(raw), dtype=torch.int32).float() / 2147483648.0
     raise ValueError(f"unsupported WAV sample width: {sample_width}")
 
 
-def _resample(audio: np.ndarray, source_rate: int, target_rate: int = SAMPLE_RATE) -> np.ndarray:
+def _resample(audio: torch.Tensor, source_rate: int, target_rate: int = SAMPLE_RATE) -> torch.Tensor:
     if source_rate == target_rate:
-        return audio.astype(np.float32, copy=False)
+        return audio.float()
     target_length = max(1, round(len(audio) * target_rate / source_rate))
-    tensor = torch.from_numpy(audio.astype(np.float32)).view(1, 1, -1)
+    tensor = audio.float().view(1, 1, -1)
     resampled = F.interpolate(tensor, size=target_length, mode="linear", align_corners=False)
-    return resampled.view(-1).numpy().astype(np.float32)
+    return resampled.view(-1).float()
 
 
-def _load_wav(path: Path, sample_rate: int = SAMPLE_RATE) -> np.ndarray:
+def _load_wav(path: Path, sample_rate: int = SAMPLE_RATE) -> torch.Tensor:
     with wave.open(str(path), "rb") as wav:
         channels = wav.getnchannels()
         source_rate = wav.getframerate()
@@ -72,11 +74,11 @@ def _load_wav(path: Path, sample_rate: int = SAMPLE_RATE) -> np.ndarray:
         frames = wav.readframes(wav.getnframes())
     audio = _decode_pcm(frames, sample_width)
     if channels > 1:
-        audio = audio.reshape(-1, channels).mean(axis=1)
+        audio = audio.view(-1, channels).mean(dim=1)
     return _resample(audio, source_rate, sample_rate)
 
 
-def _load_with_ffmpeg(path: Path, sample_rate: int = SAMPLE_RATE) -> np.ndarray:
+def _load_with_ffmpeg(path: Path, sample_rate: int = SAMPLE_RATE) -> torch.Tensor:
     cmd = [
         "ffmpeg",
         "-nostdin",
@@ -95,49 +97,106 @@ def _load_with_ffmpeg(path: Path, sample_rate: int = SAMPLE_RATE) -> np.ndarray:
         "-",
     ]
     process = subprocess.run(cmd, capture_output=True, check=True)
-    return np.frombuffer(process.stdout, np.int16).flatten().astype(np.float32) / 32768.0
+    return torch.frombuffer(bytearray(process.stdout), dtype=torch.int16).flatten().float() / 32768.0
 
 
-def load_audio(path: str | Path, sample_rate: int = SAMPLE_RATE) -> np.ndarray:
+def _npy_dtype(descr: str) -> torch.dtype:
+    if descr in {"<f4", "|f4"}:
+        return torch.float32
+    if descr in {"<f8", "|f8"}:
+        return torch.float64
+    if descr in {"<i2", "|i2"}:
+        return torch.int16
+    if descr in {"<i4", "|i4"}:
+        return torch.int32
+    if descr in {"<i8", "|i8"}:
+        return torch.int64
+    if descr in {"|u1", "<u1"}:
+        return torch.uint8
+    if descr in {"|i1", "<i1"}:
+        return torch.int8
+    raise ValueError(f"unsupported npy dtype: {descr}")
+
+
+def _load_npy_bytes(payload: bytes) -> torch.Tensor:
+    if not payload.startswith(b"\x93NUMPY"):
+        raise ValueError("not an npy payload")
+    major = payload[6]
+    if major == 1:
+        header_len = struct.unpack("<H", payload[8:10])[0]
+        data_offset = 10 + header_len
+        header_start = 10
+    elif major in {2, 3}:
+        header_len = struct.unpack("<I", payload[8:12])[0]
+        data_offset = 12 + header_len
+        header_start = 12
+    else:
+        raise ValueError(f"unsupported npy version: {major}")
+
+    header = ast.literal_eval(payload[header_start:data_offset].decode("latin1"))
+    if header.get("fortran_order"):
+        raise ValueError("Fortran-order npy arrays are not supported")
+    shape = tuple(int(dim) for dim in header["shape"])
+    dtype = _npy_dtype(str(header["descr"]))
+    count = math.prod(shape) if shape else 1
+    tensor = torch.frombuffer(bytearray(payload[data_offset:]), dtype=dtype)[:count]
+    return tensor.reshape(shape).float()
+
+
+def _load_npy(path: Path) -> torch.Tensor:
+    return _load_npy_bytes(path.read_bytes())
+
+
+def _load_npz(path: Path, key: str | None = None) -> torch.Tensor:
+    with zipfile.ZipFile(path) as archive:
+        names = sorted(name for name in archive.namelist() if name.endswith(".npy"))
+        if not names:
+            raise ValueError(f"{path} does not contain any npy arrays")
+        selected = f"{key}.npy" if key is not None else names[0]
+        if selected not in names:
+            raise KeyError(f"{path} does not contain {selected}")
+        return _load_npy_bytes(archive.read(selected))
+
+
+def load_audio(path: str | Path, sample_rate: int = SAMPLE_RATE) -> torch.Tensor:
     path = Path(path)
     suffix = path.suffix.lower()
     if suffix == ".npy":
-        return np.load(path).astype(np.float32)
+        return _load_npy(path)
     if suffix == ".npz":
-        with np.load(path) as data:
-            first_key = sorted(data.files)[0]
-            return data[first_key].astype(np.float32)
+        return _load_npz(path)
     if suffix == ".wav":
         return _load_wav(path, sample_rate)
     return _load_with_ffmpeg(path, sample_rate)
 
 
-def pad_or_trim(audio: np.ndarray, length: int = N_SAMPLES) -> np.ndarray:
-    if len(audio) >= length:
-        return audio[:length].astype(np.float32, copy=False)
-    return np.pad(audio.astype(np.float32, copy=False), (0, length - len(audio)))
+def pad_or_trim(audio: torch.Tensor, length: int = N_SAMPLES) -> torch.Tensor:
+    audio = audio.flatten().float()
+    if audio.numel() >= length:
+        return audio[:length]
+    return F.pad(audio, (0, length - audio.numel()))
 
 
-def _hz_to_mel(frequencies: np.ndarray) -> np.ndarray:
-    frequencies = np.asarray(frequencies)
+def _hz_to_mel(frequencies: torch.Tensor) -> torch.Tensor:
+    frequencies = frequencies.float()
     mels = frequencies / 200.0
     min_log_hz = 1000.0
     min_log_mel = min_log_hz / 200.0
     logstep = math.log(6.4) / 27.0
     log_region = frequencies >= min_log_hz
-    mels[log_region] = min_log_mel + np.log(frequencies[log_region] / min_log_hz) / logstep
-    return mels
+    log_mels = min_log_mel + torch.log(torch.clamp(frequencies, min=min_log_hz) / min_log_hz) / logstep
+    return torch.where(log_region, log_mels, mels)
 
 
-def _mel_to_hz(mels: np.ndarray) -> np.ndarray:
-    mels = np.asarray(mels)
+def _mel_to_hz(mels: torch.Tensor) -> torch.Tensor:
+    mels = mels.float()
     frequencies = 200.0 * mels
     min_log_hz = 1000.0
     min_log_mel = min_log_hz / 200.0
     logstep = math.log(6.4) / 27.0
     log_region = mels >= min_log_mel
-    frequencies[log_region] = min_log_hz * np.exp(logstep * (mels[log_region] - min_log_mel))
-    return frequencies
+    log_frequencies = min_log_hz * torch.exp(logstep * (mels - min_log_mel))
+    return torch.where(log_region, log_frequencies, frequencies)
 
 
 _MEL_FILTER_CACHE: dict[int, torch.Tensor] = {}
@@ -174,18 +233,18 @@ def _mel_filter_asset_path() -> Path | None:
 
 
 def _analytic_mel_filters(n_mels: int) -> torch.Tensor:
-    mel_min = _hz_to_mel(np.array([0.0]))[0]
-    mel_max = _hz_to_mel(np.array([SAMPLE_RATE / 2]))[0]
-    mel_points = np.linspace(mel_min, mel_max, n_mels + 2)
+    mel_min = _hz_to_mel(torch.tensor([0.0]))[0]
+    mel_max = _hz_to_mel(torch.tensor([SAMPLE_RATE / 2]))[0]
+    mel_points = torch.linspace(mel_min, mel_max, n_mels + 2)
     hz_points = _mel_to_hz(mel_points)
-    fft_frequencies = np.linspace(0, SAMPLE_RATE / 2, N_FFT // 2 + 1)
+    fft_frequencies = torch.linspace(0, SAMPLE_RATE / 2, N_FFT // 2 + 1)
     ramps = hz_points[:, None] - fft_frequencies[None, :]
-    fdiff = np.diff(hz_points)
+    fdiff = hz_points[1:] - hz_points[:-1]
     lower = -ramps[:-2] / fdiff[:-1, None]
     upper = ramps[2:] / fdiff[1:, None]
-    weights = np.maximum(0.0, np.minimum(lower, upper))
+    weights = torch.clamp(torch.minimum(lower, upper), min=0.0)
     weights *= (2.0 / (hz_points[2 : n_mels + 2] - hz_points[:n_mels]))[:, None]
-    return torch.from_numpy(weights.astype(np.float32))
+    return weights.float()
 
 
 def mel_filters(n_mels: int, device: torch.device) -> torch.Tensor:
@@ -193,21 +252,15 @@ def mel_filters(n_mels: int, device: torch.device) -> torch.Tensor:
     if cached is None:
         asset_path = _mel_filter_asset_path() if n_mels in {80, 128} else None
         if asset_path is not None:
-            with np.load(asset_path, allow_pickle=False) as data:
-                cached = torch.from_numpy(data[f"mel_{n_mels}"].astype(np.float32))
+            cached = _load_npz(asset_path, f"mel_{n_mels}")
         else:
             cached = _analytic_mel_filters(n_mels)
         _MEL_FILTER_CACHE[n_mels] = cached
     return cached.to(device)
 
 
-def log_mel_spectrogram(audio: np.ndarray | torch.Tensor, n_mels: int) -> torch.Tensor:
-    if not torch.is_tensor(audio):
-        audio = torch.from_numpy(pad_or_trim(audio))
-    else:
-        audio = audio.float()
-        if audio.numel() != N_SAMPLES:
-            audio = torch.from_numpy(pad_or_trim(audio.cpu().numpy()))
+def log_mel_spectrogram(audio: torch.Tensor, n_mels: int) -> torch.Tensor:
+    audio = pad_or_trim(audio.float())
 
     window = torch.hann_window(N_FFT, device=audio.device)
     stft = torch.stft(audio, N_FFT, HOP_LENGTH, window=window, return_complex=True)
@@ -282,7 +335,7 @@ class DataCollatorSpeechSeq2SeqWithPadding:
 
         labels = labels.masked_fill(attention_mask.ne(1), -100)
         if labels.shape[1] > 0 and bool((labels[:, 0] == self.sot_token_id).all().item()):
-            labels = labels[:, 1:]
+            labels = labels[:, 1:].contiguous()
 
         return {
             "input_features": input_features,

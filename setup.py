@@ -35,7 +35,7 @@ setup(
         +test=plu.test:main
         +tok=plu.tok:main
     """,
-    install_requires=["numpy", "torch", "soundfile", "faster-whisper"],
+    install_requires=["torch", "soundfile", "faster-whisper"],
     python_requires=">=3.8",
     include_package_data=True,
     package_data={"plu": ["VERSION", "assets/*.npz", "assets/*.tiktoken"]},

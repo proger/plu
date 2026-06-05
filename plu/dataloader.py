@@ -3,8 +3,6 @@ import json
 import logging
 from pathlib import Path
 
-import numpy as np
-
 from plu.tokenizer import WhisperTokenizer, get_tokenizer
 from plu.train_data import Corpus, register_data_args
 from plu.whisper import load_config
@@ -50,8 +48,8 @@ def load_tokenizer_and_n_mels(args: argparse.Namespace) -> tuple[WhisperTokenize
 
 
 def batch_summary(batch, tokenizer: WhisperTokenizer, batch_index: int) -> dict:
-    labels = batch["labels"].cpu().numpy()
-    labels_for_decode = np.where(labels != -100, labels, tokenizer.pad_token_id)
+    labels = batch["labels"].cpu()
+    labels_for_decode = labels.masked_fill(labels.eq(-100), tokenizer.pad_token_id)
     decoded_labels = tokenizer.batch_decode(labels_for_decode, skip_special_tokens=True)
     token_pieces = []
     for label in labels_for_decode:
