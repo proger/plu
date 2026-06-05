@@ -16,8 +16,8 @@ import torch
 from plu.lora import LoraConfig, apply_lora, print_trainable_parameters, save_lora_adapters
 from plu.train_data import Corpus, register_data_args
 from plu.wer import word_error_rate
-from plu.whisper_model import WhisperForConditionalGeneration, resolve_model_path
-from plu.whisper_tokenizer import WhisperTokenizer
+from plu.tokenizer import WhisperTokenizer
+from plu.whisper import WhisperForConditionalGeneration, resolve_model_path
 
 
 logger = logging.getLogger(__name__)

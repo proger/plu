@@ -14,7 +14,7 @@ import torch
 import torch.nn.functional as F
 from torch.utils.data import DataLoader, Dataset
 
-from plu.whisper_tokenizer import WhisperTokenizer
+from plu.tokenizer import WhisperTokenizer
 
 
 SAMPLE_RATE = 16000
