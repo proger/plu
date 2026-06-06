@@ -13,6 +13,7 @@ from plu.train_data import load_audio, log_mel_spectrogram
 
 
 DEFAULT_WAV = "data/segments/wav/S01496-N00113931549-U0000002-0004842-0007981.wav"
+DEFAULT_OUT = Path(__file__).resolve().parent / "assets" / "realistic_inputs.pt"
 
 
 def _summary(tensor: torch.Tensor) -> dict[str, Any]:
@@ -84,7 +85,7 @@ def main() -> None:
     parser.add_argument("--model", required=True, help="Local model path or Hugging Face repo id.")
     parser.add_argument("--wav", default=DEFAULT_WAV)
     parser.add_argument("--device", default="cuda")
-    parser.add_argument("--out", type=Path, default=Path("realistic_inputs.pt"))
+    parser.add_argument("--out", type=Path, default=DEFAULT_OUT)
     args = parser.parse_args()
 
     payload = collect_realistic_inputs(args.model, args.wav, args.device)

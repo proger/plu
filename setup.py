@@ -38,6 +38,6 @@ setup(
     install_requires=["torch", "soundfile"],
     python_requires=">=3.8",
     include_package_data=True,
-    package_data={"plu": ["VERSION", "assets/*.npz", "assets/*.tiktoken"]},
+    package_data={"plu": ["VERSION", "assets/*.npz", "assets/*.pt", "assets/*.tiktoken"]},
     license_files=["LICENSE", "THIRD_PARTY_NOTICES.md"],
 )

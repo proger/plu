@@ -11,7 +11,7 @@ import torch
 
 
 ROOT = Path(__file__).resolve().parents[1]
-DEFAULT_INPUTS = ROOT / "realistic_inputs.pt"
+DEFAULT_INPUTS = ROOT / "plu" / "assets" / "realistic_inputs.pt"
 DEFAULT_MODEL = (
     Path(os.environ.get("PLU_MODEL_CACHE", "~/.cache/plu/models")).expanduser()
     / "openai--whisper-large-v3-turbo"
@@ -51,7 +51,7 @@ def _required_file(path: Path, reason: str) -> Path:
 def _realistic_inputs_path() -> Path:
     return _required_file(
         Path(os.environ.get("PLU_REALISTIC_INPUTS", str(DEFAULT_INPUTS))).expanduser(),
-        "realistic input payload is required; generate realistic_inputs.pt first",
+        "realistic input payload is required; generate plu/assets/realistic_inputs.pt first",
     )
 
 
