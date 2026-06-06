@@ -229,11 +229,12 @@ def linear_weight_bias_grad(grad_out: Tensor, x: Tensor, has_bias: bool, dtype: 
     in_features = x.shape[1]
     grad_dtype = grad_out.dtype if dtype is None else dtype
     use_large_tiles = rows >= 512 and out_features >= 512 and in_features >= 256
+    use_reduce_kernel = use_large_tiles or (rows >= 128 and out_features >= 512 and in_features >= 512)
     cast_grad_to_float = grad_out.dtype != x.dtype and grad_out.dtype != torch.float32
     cast_input_to_float = grad_out.dtype != x.dtype and x.dtype != torch.float32
     inputs_are_fp32 = (grad_out.dtype == torch.float32 or cast_grad_to_float) and (x.dtype == torch.float32 or cast_input_to_float)
-    use_tf32 = inputs_are_fp32 and (use_large_tiles or cast_grad_to_float or cast_input_to_float)
-    if use_large_tiles:
+    use_tf32 = inputs_are_fp32 and (use_reduce_kernel or cast_grad_to_float or cast_input_to_float)
+    if use_reduce_kernel:
         grad_weight = torch.empty((out_features, in_features), device=grad_out.device, dtype=grad_dtype)
     else:
         grad_weight = torch.zeros((out_features, in_features), device=grad_out.device, dtype=grad_dtype)
@@ -243,10 +244,24 @@ def linear_weight_bias_grad(grad_out: Tensor, x: Tensor, has_bias: bool, dtype: 
         return grad_weight, grad_bias
 
     fold_bias_grad = has_bias and os.environ.get("PLU_FOLD_LINEAR_BIAS_GRAD", "1") != "0"
-    block_n = 64 if use_large_tiles else 32
-    block_k = 128 if use_large_tiles else 32
-    block_m = 16 if use_large_tiles else 32
-    if use_large_tiles:
+    if use_reduce_kernel:
+        if rows < 512 and out_features >= 16384:
+            block_n = 64
+            block_k = 128
+            block_m = 16
+        elif rows < 512:
+            block_n = 128
+            block_k = 64
+            block_m = 32
+        else:
+            block_n = 64
+            block_k = 128
+            block_m = 64 if out_features >= 4096 and in_features <= 2048 else 32
+    else:
+        block_n = 32
+        block_k = 32
+        block_m = 32
+    if use_reduce_kernel:
         _linear_weight_grad_reduce_kernel[(triton.cdiv(out_features, block_n), triton.cdiv(in_features, block_k))](
             grad_out,
             x,
