@@ -75,6 +75,16 @@ def extend_encoder_positions(model: torch.nn.Module, positions: int) -> bool:
     return True
 
 
+def encoder_backward_start(total_layers: int, backward_layers: int | None) -> int:
+    if backward_layers is None:
+        return 0
+    if backward_layers < 0:
+        raise ValueError("--encoder-backward-layers must be non-negative")
+    if backward_layers > total_layers:
+        raise ValueError(f"--encoder-backward-layers={backward_layers} exceeds encoder layer count {total_layers}")
+    return total_layers - backward_layers
+
+
 @dataclass(frozen=True)
 class PackedMxLinear:
     packed_weight: torch.Tensor
@@ -327,6 +337,7 @@ def packed_mx_forward(
     input_features: torch.Tensor,
     labels: torch.Tensor,
     master_weight_grads: bool,
+    encoder_backward_layers: int | None = None,
 ) -> Any:
     from plu.triton.conv1d_gelu import conv1d_gelu
     from plu.triton.cross_entropy import cross_entropy
@@ -340,7 +351,13 @@ def packed_mx_forward(
     hidden_states = conv1d_gelu(hidden_states, encoder.conv2.weight, encoder.conv2.bias, encoder.conv2.stride[0], encoder.conv2.padding[0])
     hidden_states = hidden_states.transpose(1, 2)
     hidden_states = encoder_position_embedding(hidden_states, encoder.embed_positions.weight)
-    for layer in encoder.layers:
+    backward_start = encoder_backward_start(len(encoder.layers), encoder_backward_layers) if master_weight_grads else 0
+    for layer in encoder.layers[:backward_start]:
+        with torch.no_grad():
+            hidden_states = _packed_encoder_layer(packed, layer, hidden_states, master_weight_grads=False)
+    if backward_start:
+        hidden_states = hidden_states.detach()
+    for layer in encoder.layers[backward_start:]:
         hidden_states = _packed_encoder_layer(packed, layer, hidden_states, master_weight_grads)
     encoder_hidden_states = layer_norm(hidden_states, encoder.layer_norm.weight, encoder.layer_norm.bias, encoder.layer_norm.eps)
 
@@ -353,6 +370,39 @@ def packed_mx_forward(
     decoder_hidden_states = layer_norm(hidden_states, decoder.layer_norm.weight, decoder.layer_norm.bias, decoder.layer_norm.eps)
 
     logits = _packed_linear(packed, model.proj_out, decoder_hidden_states, master_weight_grads).float()
+    loss = cross_entropy(logits, labels, ignore_index=-100)
+    return Seq2SeqOutput(loss=loss, logits=logits)
+
+
+def limited_model_forward(
+    model: torch.nn.Module,
+    input_features: torch.Tensor,
+    labels: torch.Tensor,
+    encoder_backward_layers: int | None = None,
+) -> Any:
+    from plu.whisper import Seq2SeqOutput, cross_entropy, encoder_position_embedding, shift_tokens_right
+
+    encoder = model.model.encoder
+    decoder = model.model.decoder
+    hidden_states = encoder.conv1(input_features)
+    hidden_states = encoder.conv2(hidden_states)
+    hidden_states = hidden_states.transpose(1, 2)
+    if hidden_states.shape[1] > encoder.config.max_source_positions:
+        raise ValueError(f"input features are too long: {hidden_states.shape[1]} > {encoder.config.max_source_positions}")
+    hidden_states = encoder_position_embedding(hidden_states, encoder.embed_positions.weight)
+    backward_start = encoder_backward_start(len(encoder.layers), encoder_backward_layers)
+    for layer in encoder.layers[:backward_start]:
+        with torch.no_grad():
+            hidden_states = layer(hidden_states)
+    if backward_start:
+        hidden_states = hidden_states.detach()
+    for layer in encoder.layers[backward_start:]:
+        hidden_states = layer(hidden_states)
+    encoder_hidden_states = encoder.layer_norm(hidden_states)
+
+    decoder_input_ids = shift_tokens_right(labels, model.config.pad_token_id, model.config.decoder_start_token_id)
+    decoder_hidden_states = decoder(decoder_input_ids, encoder_hidden_states)
+    logits = model.proj_out(decoder_hidden_states).float()
     loss = cross_entropy(logits, labels, ignore_index=-100)
     return Seq2SeqOutput(loss=loss, logits=logits)
 
@@ -397,20 +447,39 @@ def run_child(args: argparse.Namespace) -> dict[str, Any]:
     mx_stats: dict[str, Any] = {}
     if args.child_backend in {"mxfp8", "mxfp4"}:
         packed_mx, mx_stats = pack_mx_model(model, args.child_backend)
+    total_encoder_layers = len(model.model.encoder.layers)
+    backward_encoder_layer_start = encoder_backward_start(total_encoder_layers, args.encoder_backward_layers)
 
     def step() -> tuple[torch.Tensor, torch.Size]:
         if args.mode == "forward":
             with torch.no_grad():
                 if packed_mx is not None:
-                    output = packed_mx_forward(model, packed_mx, input_features, labels, master_weight_grads=False)
+                    output = packed_mx_forward(
+                        model,
+                        packed_mx,
+                        input_features,
+                        labels,
+                        master_weight_grads=False,
+                        encoder_backward_layers=None,
+                    )
                 else:
                     output = model(input_features, labels=labels)
         else:
             model.zero_grad(set_to_none=True)
             if packed_mx is not None:
-                output = packed_mx_forward(model, packed_mx, input_features, labels, master_weight_grads=True)
+                output = packed_mx_forward(
+                    model,
+                    packed_mx,
+                    input_features,
+                    labels,
+                    master_weight_grads=True,
+                    encoder_backward_layers=args.encoder_backward_layers,
+                )
             else:
-                output = model(input_features, labels=labels)
+                if args.encoder_backward_layers is None:
+                    output = model(input_features, labels=labels)
+                else:
+                    output = limited_model_forward(model, input_features, labels, args.encoder_backward_layers)
         if output.loss is None:
             raise RuntimeError("expected loss for end-to-end benchmark")
         if args.mode == "forward_backward":
@@ -478,6 +547,9 @@ def run_child(args: argparse.Namespace) -> dict[str, Any]:
         "audio_seconds_per_sample": audio_secs_per_sample,
         "processed_audio_seconds": processed_audio_secs,
         "encoder_tokens_after_conv": encoder_tokens,
+        "encoder_layers": total_encoder_layers,
+        "encoder_backward_layers": args.encoder_backward_layers if args.mode == "forward_backward" else None,
+        "encoder_backward_layer_start": backward_encoder_layer_start if args.mode == "forward_backward" else None,
         "decoder_tokens": args.decoder_len,
         "input_features_shape": list(input_features.shape),
         "labels_shape": list(labels.shape),
@@ -519,6 +591,8 @@ def child_argv(args: argparse.Namespace, backend: str) -> list[str]:
         str(args.feature_fps),
         "--decoder-len",
         str(args.decoder_len),
+        "--encoder-backward-layers",
+        "none" if args.encoder_backward_layers is None else str(args.encoder_backward_layers),
         "--mode",
         args.mode,
         "--warmup",
@@ -577,6 +651,9 @@ def run_parent(args: argparse.Namespace) -> None:
             "audio_seconds_per_sample": by_target["triton"]["audio_seconds_per_sample"],
             "processed_audio_seconds": by_target["triton"]["processed_audio_seconds"],
             "encoder_tokens_after_conv": by_target["triton"]["encoder_tokens_after_conv"],
+            "encoder_layers": by_target["triton"]["encoder_layers"],
+            "encoder_backward_layers": by_target["triton"]["encoder_backward_layers"],
+            "encoder_backward_layer_start": by_target["triton"]["encoder_backward_layer_start"],
             "decoder_tokens": args.decoder_len,
             "ref_mean_ms": ref_ms,
             "triton_mean_ms": triton_ms,
@@ -615,6 +692,9 @@ def run_parent(args: argparse.Namespace) -> None:
                 "audio_seconds": by_target[target]["audio_seconds"],
                 "audio_seconds_per_sample": by_target[target]["audio_seconds_per_sample"],
                 "processed_audio_seconds": by_target[target]["processed_audio_seconds"],
+                "encoder_layers": by_target[target]["encoder_layers"],
+                "encoder_backward_layers": by_target[target]["encoder_backward_layers"],
+                "encoder_backward_layer_start": by_target[target]["encoder_backward_layer_start"],
                 "decoder_tokens": args.decoder_len,
                 "baseline_mean_ms": baseline["mean_ms"],
                 "target_mean_ms": target_ms,
@@ -641,6 +721,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--input-features", type=int, default=3000, help="Input feature frames before Whisper conv downsampling.")
     parser.add_argument("--feature-fps", type=float, default=DEFAULT_FEATURE_FPS, help="Input feature frames per second of audio.")
     parser.add_argument("--decoder-len", type=int, default=448)
+    parser.add_argument(
+        "--encoder-backward-layers",
+        default=None,
+        help="For forward_backward, run full encoder forward but backprop through only the last N encoder layers. Use 'none' for all layers.",
+    )
     parser.add_argument("--mode", choices=["forward", "forward_backward"], default="forward_backward")
     parser.add_argument("--warmup", type=int, default=1)
     parser.add_argument("--iters", type=int, default=3)
@@ -655,6 +740,11 @@ def parse_args() -> argparse.Namespace:
         raise ValueError("--warmup must be non-negative")
     if args.feature_fps <= 0:
         raise ValueError("--feature-fps must be positive")
+    if args.encoder_backward_layers is not None:
+        if str(args.encoder_backward_layers).lower() == "none":
+            args.encoder_backward_layers = None
+        else:
+            args.encoder_backward_layers = int(args.encoder_backward_layers)
     return args
 
 
