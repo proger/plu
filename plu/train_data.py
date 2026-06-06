@@ -309,6 +309,7 @@ class JsonlAudioDataset(Dataset):
             "input_features": input_features,
             "labels": torch.tensor(labels, dtype=torch.long),
             "text": example.get("text"),
+            "duration": example.get("duration"),
         }
 
 
@@ -341,6 +342,13 @@ class DataCollatorSpeechSeq2SeqWithPadding:
             "input_features": input_features,
             "labels": labels,
             "texts": [feature.get("text") for feature in features],
+            "durations": torch.tensor(
+                [
+                    float(feature["duration"]) if feature.get("duration") is not None else feature["input_features"].shape[-1] / (SAMPLE_RATE / HOP_LENGTH)
+                    for feature in features
+                ],
+                dtype=torch.float32,
+            ),
         }
 
 

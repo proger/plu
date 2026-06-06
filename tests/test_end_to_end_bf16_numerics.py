@@ -18,6 +18,7 @@ DEFAULT_MODEL = (
 )
 GRAD_SLICE = 128
 DECODER_TOKENS = 4
+ENCODER_BACKWARD_LAYERS = 24
 
 
 def _set_tf32(enabled: bool) -> None:
@@ -86,12 +87,77 @@ def _labels_from_payload(payload: dict[str, torch.Tensor]) -> torch.Tensor:
     return labels[:, :DECODER_TOKENS].long().contiguous()
 
 
+def _keep_layer_norm_parameters_high_precision(model: torch.nn.Module) -> None:
+    for module in model.modules():
+        if isinstance(module, torch.nn.LayerNorm):
+            module.to(dtype=torch.float32)
+
+
+def _layer_norm_parameter_dtypes(model: torch.nn.Module) -> list[str]:
+    dtypes = []
+    for module in model.modules():
+        if isinstance(module, torch.nn.LayerNorm):
+            dtypes.append(str(module.weight.dtype))
+            if module.bias is not None:
+                dtypes.append(str(module.bias.dtype))
+    return dtypes
+
+
+def _pack_frozen_encoder_layers(model: torch.nn.Module, frozen_layers: int):
+    from benchmarks.bench_end_to_end import pack_mx_linear
+
+    packed = {}
+    for layer in model.model.encoder.layers[:frozen_layers]:
+        for module in layer.modules():
+            if module.__class__.__name__ == "CastLinear":
+                packed[id(module)] = pack_mx_linear(module, "mxfp8")
+    return packed
+
+
+def _limited_forward(
+    model: torch.nn.Module,
+    input_features: torch.Tensor,
+    labels: torch.Tensor,
+    *,
+    frozen_encoder_mxfp8: bool,
+):
+    from benchmarks.bench_end_to_end import _packed_encoder_layer, encoder_backward_start
+    from plu.whisper import Seq2SeqOutput, cross_entropy, encoder_position_embedding, shift_tokens_right
+
+    encoder = model.model.encoder
+    hidden_states = encoder.conv1(input_features)
+    hidden_states = encoder.conv2(hidden_states)
+    hidden_states = hidden_states.transpose(1, 2)
+    hidden_states = encoder_position_embedding(hidden_states, encoder.embed_positions.weight)
+
+    backward_start = encoder_backward_start(len(encoder.layers), ENCODER_BACKWARD_LAYERS)
+    packed = _pack_frozen_encoder_layers(model, backward_start) if frozen_encoder_mxfp8 and backward_start else None
+    for layer in encoder.layers[:backward_start]:
+        with torch.no_grad():
+            if packed is None:
+                hidden_states = layer(hidden_states)
+            else:
+                hidden_states = _packed_encoder_layer(packed, layer, hidden_states, master_weight_grads=False)
+    if backward_start:
+        hidden_states = hidden_states.detach()
+    for layer in encoder.layers[backward_start:]:
+        hidden_states = layer(hidden_states)
+    encoder_hidden_states = encoder.layer_norm(hidden_states)
+
+    decoder_input_ids = shift_tokens_right(labels, model.config.pad_token_id, model.config.decoder_start_token_id)
+    decoder_hidden_states = model.model.decoder(decoder_input_ids, encoder_hidden_states)
+    logits = model.proj_out(decoder_hidden_states).float()
+    loss = cross_entropy(logits, labels, ignore_index=-100)
+    return Seq2SeqOutput(loss=loss, logits=logits), backward_start, len(packed) if packed is not None else 0
+
+
 def _child_main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--backend", choices=("ref", "triton"), required=True)
     parser.add_argument("--model", required=True)
     parser.add_argument("--inputs", required=True)
     parser.add_argument("--out", required=True)
+    parser.add_argument("--frozen-encoder-mxfp8", action="store_true")
     args = parser.parse_args()
 
     os.environ["PLU_OPS_BACKEND"] = args.backend
@@ -107,6 +173,7 @@ def _child_main() -> None:
 
     model = WhisperForConditionalGeneration.from_pretrained(args.model)
     model.to(device=device, dtype=torch.bfloat16)
+    _keep_layer_norm_parameters_high_precision(model)
     model.train()
     model.zero_grad(set_to_none=True)
 
@@ -123,7 +190,12 @@ def _child_main() -> None:
         model.model.decoder.register_forward_hook(save_activation("decoder_hidden")),
     ]
     try:
-        output = model(input_features, labels=labels)
+        output, encoder_backward_layer_start, frozen_encoder_packed_linear_count = _limited_forward(
+            model,
+            input_features,
+            labels,
+            frozen_encoder_mxfp8=args.frozen_encoder_mxfp8,
+        )
         assert output.loss is not None
         output.loss.backward()
         torch.cuda.synchronize()
@@ -131,20 +203,27 @@ def _child_main() -> None:
         for handle in handles:
             handle.remove()
 
-    encoder_layer = model.model.encoder.layers[0]
+    frozen_encoder_layer = model.model.encoder.layers[0]
+    encoder_layer = model.model.encoder.layers[encoder_backward_layer_start]
     decoder_layer = model.model.decoder.layers[0]
     result = {
         "backend": args.backend,
         "weight_dtype": str(next(model.parameters()).dtype),
         "input_dtype": str(input_features.dtype),
+        "layer_norm_parameter_dtypes": _layer_norm_parameter_dtypes(model),
+        "encoder_backward_layers": ENCODER_BACKWARD_LAYERS,
+        "encoder_backward_layer_start": encoder_backward_layer_start,
+        "frozen_encoder_weight_format": "mxfp8" if args.frozen_encoder_mxfp8 else "bf16",
+        "frozen_encoder_packed_linear_count": frozen_encoder_packed_linear_count,
+        "frozen_encoder_self_q_weight_grad_is_none": frozen_encoder_layer.self_attn.q_proj.weight.grad is None,
+        "encoder_conv1_weight_grad_is_none": model.model.encoder.conv1.weight.grad is None,
         "labels": labels.detach().cpu(),
         "loss": output.loss.detach().float().cpu(),
         "logits": output.logits.detach().float().cpu(),
         "activations": activations,
         "grads": {
-            "encoder_conv1_weight": _slice_grad(model.model.encoder.conv1.weight),
-            "encoder_self_q_weight": _slice_grad(encoder_layer.self_attn.q_proj.weight),
-            "encoder_mlp_fc1_weight": _slice_grad(encoder_layer.fc1.weight),
+            "encoder_train_self_q_weight": _slice_grad(encoder_layer.self_attn.q_proj.weight),
+            "encoder_train_mlp_fc1_weight": _slice_grad(encoder_layer.fc1.weight),
             "decoder_self_q_weight": _slice_grad(decoder_layer.self_attn.q_proj.weight),
             "decoder_cross_q_weight": _slice_grad(decoder_layer.encoder_attn.q_proj.weight),
             "decoder_proj_out_weight": _slice_grad(model.proj_out.weight),
@@ -168,6 +247,8 @@ def _run_backend(backend: str, model: Path, inputs: Path, out: Path) -> None:
         "--out",
         str(out),
     ]
+    if backend == "triton":
+        command.append("--frozen-encoder-mxfp8")
     completed = subprocess.run(
         command,
         cwd=ROOT,
@@ -242,6 +323,19 @@ def test_whisper_turbo_real_inputs_bf16_weights_end_to_end_numerics(tmp_path: Pa
     assert triton["weight_dtype"] == "torch.bfloat16"
     assert ref["input_dtype"] == "torch.bfloat16"
     assert triton["input_dtype"] == "torch.bfloat16"
+    assert set(ref["layer_norm_parameter_dtypes"]) == {"torch.float32"}
+    assert set(triton["layer_norm_parameter_dtypes"]) == {"torch.float32"}
+    assert ref["encoder_backward_layers"] == ENCODER_BACKWARD_LAYERS
+    assert triton["encoder_backward_layers"] == ENCODER_BACKWARD_LAYERS
+    assert ref["encoder_backward_layer_start"] == 8
+    assert triton["encoder_backward_layer_start"] == 8
+    assert ref["frozen_encoder_weight_format"] == "bf16"
+    assert triton["frozen_encoder_weight_format"] == "mxfp8"
+    assert triton["frozen_encoder_packed_linear_count"] == 48
+    assert ref["frozen_encoder_self_q_weight_grad_is_none"]
+    assert triton["frozen_encoder_self_q_weight_grad_is_none"]
+    assert ref["encoder_conv1_weight_grad_is_none"]
+    assert triton["encoder_conv1_weight_grad_is_none"]
     torch.testing.assert_close(triton["labels"], ref["labels"], atol=0, rtol=0)
 
     _assert_close("loss", triton["loss"], ref["loss"], atol=1.2e-1, rtol=2e-2)
@@ -261,7 +355,7 @@ def test_whisper_turbo_real_inputs_bf16_weights_end_to_end_numerics(tmp_path: Pa
         min_cosine=9.98e-1,
     )
 
-    for name in ("encoder_conv1_weight", "encoder_self_q_weight", "encoder_mlp_fc1_weight"):
+    for name in ("encoder_train_self_q_weight", "encoder_train_mlp_fc1_weight"):
         _assert_grad_sanity(f"{name}.grad", triton["grads"][name], ref["grads"][name])
 
     _assert_close(
