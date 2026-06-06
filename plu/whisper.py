@@ -40,15 +40,15 @@ else:
 
 @dataclass
 class WhisperConfig:
-    vocab_size: int
-    num_mel_bins: int = 80
-    d_model: int = 384
-    encoder_layers: int = 4
-    encoder_attention_heads: int = 6
+    vocab_size: int = 51866
+    num_mel_bins: int = 128
+    d_model: int = 1280
+    encoder_layers: int = 32
+    encoder_attention_heads: int = 20
     decoder_layers: int = 4
-    decoder_attention_heads: int = 6
-    encoder_ffn_dim: int = 1536
-    decoder_ffn_dim: int = 1536
+    decoder_attention_heads: int = 20
+    encoder_ffn_dim: int = 5120
+    decoder_ffn_dim: int = 5120
     max_source_positions: int = 1500
     max_target_positions: int = 448
     pad_token_id: int = 50257
