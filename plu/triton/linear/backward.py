@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import os
+
 import torch
 import triton
 import triton.language as tl
@@ -59,9 +61,11 @@ def _linear_weight_grad_kernel(
     grad_out_ptr,
     input_ptr,
     grad_weight_ptr,
+    grad_bias_ptr,
     rows: tl.constexpr,
     out_features: tl.constexpr,
     in_features: tl.constexpr,
+    has_bias: tl.constexpr,
     use_tf32: tl.constexpr,
     cast_grad_to_float: tl.constexpr,
     cast_input_to_float: tl.constexpr,
@@ -85,6 +89,14 @@ def _linear_weight_grad_kernel(
         mask=(offs_m[:, None] < rows) & (offs_k[None, :] < in_features),
         other=0.0,
     )
+    if has_bias:
+        bias_acc = tl.sum(grad, axis=0)
+        tl.atomic_add(
+            grad_bias_ptr + offs_n,
+            bias_acc,
+            sem="relaxed",
+            mask=(pid_k == 0) & (offs_n < out_features),
+        )
     if cast_grad_to_float:
         grad = grad.to(tl.float32)
     if cast_input_to_float:
@@ -106,9 +118,11 @@ def _linear_weight_grad_reduce_kernel(
     grad_out_ptr,
     input_ptr,
     grad_weight_ptr,
+    grad_bias_ptr,
     rows: tl.constexpr,
     out_features: tl.constexpr,
     in_features: tl.constexpr,
+    has_bias: tl.constexpr,
     use_tf32: tl.constexpr,
     cast_grad_to_float: tl.constexpr,
     cast_input_to_float: tl.constexpr,
@@ -122,6 +136,7 @@ def _linear_weight_grad_reduce_kernel(
     offs_k = pid_k * block_k + tl.arange(0, block_k)
     offs_m = tl.arange(0, block_m)
     acc = tl.zeros((block_n, block_k), dtype=tl.float32)
+    bias_acc = tl.zeros((block_n,), dtype=tl.float32)
     for m_start in tl.range(0, rows, block_m):
         m = m_start + offs_m
         grad = tl.load(
@@ -129,6 +144,8 @@ def _linear_weight_grad_reduce_kernel(
             mask=(m[:, None] < rows) & (offs_n[None, :] < out_features),
             other=0.0,
         )
+        if has_bias:
+            bias_acc += tl.sum(grad, axis=0)
         x = tl.load(
             input_ptr + m[:, None] * in_features + offs_k[None, :],
             mask=(m[:, None] < rows) & (offs_k[None, :] < in_features),
@@ -147,6 +164,8 @@ def _linear_weight_grad_reduce_kernel(
         acc,
         mask=(offs_n[:, None] < out_features) & (offs_k[None, :] < in_features),
     )
+    if has_bias:
+        tl.store(grad_bias_ptr + offs_n, bias_acc, mask=(pid_k == 0) & (offs_n < out_features))
 
 
 @triton.jit
@@ -223,6 +242,7 @@ def linear_weight_bias_grad(grad_out: Tensor, x: Tensor, has_bias: bool, dtype: 
         grad_weight.zero_()
         return grad_weight, grad_bias
 
+    fold_bias_grad = has_bias and os.environ.get("PLU_FOLD_LINEAR_BIAS_GRAD", "1") != "0"
     block_n = 64 if use_large_tiles else 32
     block_k = 128 if use_large_tiles else 32
     block_m = 16 if use_large_tiles else 32
@@ -231,9 +251,11 @@ def linear_weight_bias_grad(grad_out: Tensor, x: Tensor, has_bias: bool, dtype: 
             grad_out,
             x,
             grad_weight,
+            grad_bias if grad_bias is not None else grad_weight,
             rows,
             out_features,
             in_features,
+            fold_bias_grad,
             use_tf32,
             cast_grad_to_float,
             cast_input_to_float,
@@ -249,9 +271,11 @@ def linear_weight_bias_grad(grad_out: Tensor, x: Tensor, has_bias: bool, dtype: 
             grad_out,
             x,
             grad_weight,
+            grad_bias if grad_bias is not None else grad_weight,
             rows,
             out_features,
             in_features,
+            fold_bias_grad,
             use_tf32,
             cast_grad_to_float,
             cast_input_to_float,
@@ -260,7 +284,7 @@ def linear_weight_bias_grad(grad_out: Tensor, x: Tensor, has_bias: bool, dtype: 
             block_m,
             num_warps=4,
         )
-    if grad_bias is not None:
+    if grad_bias is not None and not fold_bias_grad:
         _linear_bias_grad_kernel[(triton.cdiv(out_features, block_n), triton.cdiv(rows, block_m))](
             grad_out,
             grad_bias,
