@@ -20,6 +20,7 @@ def _flash_attention_forward_kernel(
     head_dim: tl.constexpr,
     scale: tl.constexpr,
     causal: tl.constexpr,
+    use_bf16_dot: tl.constexpr,
     block_m: tl.constexpr,
     block_n: tl.constexpr,
     block_d: tl.constexpr,
@@ -67,7 +68,10 @@ def _flash_attention_forward_kernel(
             mask=(n[:, None] < key_len) & (offs_d[None, :] < head_dim),
             other=0.0,
         )
-        acc = acc * alpha[:, None] + tl.dot(probs, value.to(tl.float32), input_precision="ieee")
+        if use_bf16_dot:
+            acc = acc * alpha[:, None] + tl.dot(probs.to(tl.bfloat16), value, input_precision="ieee")
+        else:
+            acc = acc * alpha[:, None] + tl.dot(probs, value.to(tl.float32), input_precision="ieee")
         row_sum = row_sum * alpha + tl.sum(probs, axis=1)
         row_max = new_row_max
 
@@ -105,6 +109,7 @@ def _flash_attention_forward(query: Tensor, key: Tensor, value: Tensor, causal: 
         head_dim,
         head_dim**-0.5,
         causal,
+        query.dtype is torch.bfloat16,
         block_m,
         block_n,
         block_d,
