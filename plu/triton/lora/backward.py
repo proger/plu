@@ -5,7 +5,7 @@ import triton
 import triton.language as tl
 from torch import Tensor
 
-from plu.triton.gelu_mlp.backward import linear_input_grad, linear_weight_bias_grad
+from plu.triton.linear.backward import linear_input_grad, linear_weight_bias_grad
 
 
 @triton.jit
@@ -54,4 +54,3 @@ def lora_linear_backward(
     grad_adapter_input = linear_input_grad(grad_hidden, lora_a_weight)
     grad_lora_a_weight = linear_weight_bias_grad(grad_hidden, adapter_input_2d, False, dtype=lora_a_weight.dtype)[0]
     return grad_x, grad_adapter_input, grad_base_weight, grad_base_bias, grad_lora_a_weight, grad_lora_b_weight
-

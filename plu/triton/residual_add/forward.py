@@ -5,6 +5,8 @@ import triton
 import triton.language as tl
 from torch import Tensor
 
+from plu.triton.residual_add.backward import residual_add_backward
+
 
 @triton.jit
 def _residual_add_kernel(
@@ -42,7 +44,7 @@ class _TritonResidualAdd(torch.autograd.Function):
 
     @staticmethod
     def backward(ctx, grad_out: Tensor):
-        return grad_out, grad_out
+        return residual_add_backward(grad_out)
 
 
 def residual_add(residual: Tensor, hidden_states: Tensor) -> Tensor:

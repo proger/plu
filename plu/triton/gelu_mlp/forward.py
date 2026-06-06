@@ -5,7 +5,8 @@ import triton
 import triton.language as tl
 from torch import Tensor
 
-from plu.triton.gelu_mlp.backward import linear_input_gelu_grad, linear_input_grad, linear_weight_bias_grad
+from plu.triton.gelu_mlp.backward import linear_input_gelu_grad
+from plu.triton.linear.backward import linear_input_grad, linear_weight_bias_grad
 
 
 @triton.jit
