@@ -338,6 +338,7 @@ def packed_mx_forward(
     labels: torch.Tensor,
     master_weight_grads: bool,
     encoder_backward_layers: int | None = None,
+    fused_unembedding_ce: bool = False,
 ) -> Any:
     from plu.triton.conv1d_gelu import conv1d_gelu
     from plu.triton.cross_entropy import cross_entropy
@@ -369,8 +370,14 @@ def packed_mx_forward(
         hidden_states = _packed_decoder_layer(packed, layer, hidden_states, encoder_hidden_states, decoder.causal_mask, master_weight_grads)
     decoder_hidden_states = layer_norm(hidden_states, decoder.layer_norm.weight, decoder.layer_norm.bias, decoder.layer_norm.eps)
 
-    logits = _packed_linear(packed, model.proj_out, decoder_hidden_states, master_weight_grads).float()
-    loss = cross_entropy(logits, labels, ignore_index=-100)
+    if fused_unembedding_ce:
+        from plu.triton.unembedding_cross_entropy import unembedding_cross_entropy
+
+        loss = unembedding_cross_entropy(decoder_hidden_states, model.proj_out.weight, labels, ignore_index=-100)
+        logits = decoder_hidden_states.new_empty(0)
+    else:
+        logits = _packed_linear(packed, model.proj_out, decoder_hidden_states, master_weight_grads).float()
+        loss = cross_entropy(logits, labels, ignore_index=-100)
     return Seq2SeqOutput(loss=loss, logits=logits)
 
 
@@ -379,6 +386,7 @@ def limited_model_forward(
     input_features: torch.Tensor,
     labels: torch.Tensor,
     encoder_backward_layers: int | None = None,
+    fused_unembedding_ce: bool = False,
 ) -> Any:
     from plu.whisper import Seq2SeqOutput, cross_entropy, encoder_position_embedding, shift_tokens_right
 
@@ -402,8 +410,14 @@ def limited_model_forward(
 
     decoder_input_ids = shift_tokens_right(labels, model.config.pad_token_id, model.config.decoder_start_token_id)
     decoder_hidden_states = decoder(decoder_input_ids, encoder_hidden_states)
-    logits = model.proj_out(decoder_hidden_states).float()
-    loss = cross_entropy(logits, labels, ignore_index=-100)
+    if fused_unembedding_ce:
+        from plu.triton.unembedding_cross_entropy import unembedding_cross_entropy
+
+        loss = unembedding_cross_entropy(decoder_hidden_states, model.proj_out.weight, labels, ignore_index=-100)
+        logits = decoder_hidden_states.new_empty(0)
+    else:
+        logits = model.proj_out(decoder_hidden_states).float()
+        loss = cross_entropy(logits, labels, ignore_index=-100)
     return Seq2SeqOutput(loss=loss, logits=logits)
 
 
@@ -461,9 +475,13 @@ def run_child(args: argparse.Namespace) -> dict[str, Any]:
                         labels,
                         master_weight_grads=False,
                         encoder_backward_layers=None,
+                        fused_unembedding_ce=args.fused_unembedding_ce,
                     )
                 else:
-                    output = model(input_features, labels=labels)
+                    if args.fused_unembedding_ce:
+                        output = limited_model_forward(model, input_features, labels, None, args.fused_unembedding_ce)
+                    else:
+                        output = model(input_features, labels=labels)
         else:
             model.zero_grad(set_to_none=True)
             if packed_mx is not None:
@@ -474,17 +492,22 @@ def run_child(args: argparse.Namespace) -> dict[str, Any]:
                     labels,
                     master_weight_grads=True,
                     encoder_backward_layers=args.encoder_backward_layers,
+                    fused_unembedding_ce=args.fused_unembedding_ce,
                 )
             else:
-                if args.encoder_backward_layers is None:
+                if args.encoder_backward_layers is None and not args.fused_unembedding_ce:
                     output = model(input_features, labels=labels)
                 else:
-                    output = limited_model_forward(model, input_features, labels, args.encoder_backward_layers)
+                    output = limited_model_forward(model, input_features, labels, args.encoder_backward_layers, args.fused_unembedding_ce)
         if output.loss is None:
             raise RuntimeError("expected loss for end-to-end benchmark")
         if args.mode == "forward_backward":
             output.loss.backward()
-        return output.loss.detach(), output.logits.shape
+        if output.logits.numel() == 0:
+            logits_shape = torch.Size((labels.shape[0], labels.shape[1], model.config.vocab_size))
+        else:
+            logits_shape = output.logits.shape
+        return output.loss.detach(), logits_shape
 
     times_ms: list[float] = []
     loss_value = 0.0
@@ -556,6 +579,7 @@ def run_child(args: argparse.Namespace) -> dict[str, Any]:
         "logits_shape": list(logits_shape) if logits_shape is not None else None,
         "extended_encoder_positions": extended_positions,
         "tf32": args.tf32,
+        "fused_unembedding_ce": args.fused_unembedding_ce,
         "warmup": args.warmup,
         "iters": args.iters,
         "times_ms": times_ms,
@@ -605,6 +629,7 @@ def child_argv(args: argparse.Namespace, backend: str) -> list[str]:
     argv.append("--tf32" if args.tf32 else "--no-tf32")
     argv.append("--extend-encoder-positions" if args.extend_encoder_positions else "--no-extend-encoder-positions")
     argv.append("--cuda-graph" if args.cuda_graph else "--no-cuda-graph")
+    argv.append("--fused-unembedding-ce" if args.fused_unembedding_ce else "--no-fused-unembedding-ce")
     return argv
 
 
@@ -655,6 +680,7 @@ def run_parent(args: argparse.Namespace) -> None:
             "encoder_backward_layers": by_target["triton"]["encoder_backward_layers"],
             "encoder_backward_layer_start": by_target["triton"]["encoder_backward_layer_start"],
             "decoder_tokens": args.decoder_len,
+            "fused_unembedding_ce": by_target["triton"]["fused_unembedding_ce"],
             "ref_mean_ms": ref_ms,
             "triton_mean_ms": triton_ms,
             "speedup": ref_ms / triton_ms,
@@ -696,6 +722,7 @@ def run_parent(args: argparse.Namespace) -> None:
                 "encoder_backward_layers": by_target[target]["encoder_backward_layers"],
                 "encoder_backward_layer_start": by_target[target]["encoder_backward_layer_start"],
                 "decoder_tokens": args.decoder_len,
+                "fused_unembedding_ce": by_target[target]["fused_unembedding_ce"],
                 "baseline_mean_ms": baseline["mean_ms"],
                 "target_mean_ms": target_ms,
                 "speedup_vs_baseline": actual_speedup,
@@ -733,6 +760,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--tf32", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--extend-encoder-positions", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--cuda-graph", action=argparse.BooleanOptionalAction, default=False)
+    parser.add_argument("--fused-unembedding-ce", action=argparse.BooleanOptionalAction, default=False)
     args = parser.parse_args()
     if args.iters <= 0:
         raise ValueError("--iters must be positive")

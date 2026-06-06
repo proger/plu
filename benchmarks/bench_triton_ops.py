@@ -39,6 +39,7 @@ from plu.triton.mx_linear import (
 )
 from plu.triton.qkv_proj import qkv_proj as triton_qkv_proj
 from plu.triton.residual_add import residual_add as triton_residual_add
+from plu.triton.unembedding_cross_entropy import unembedding_cross_entropy as triton_unembedding_cross_entropy
 
 
 def set_tf32(enabled: bool) -> None:
@@ -119,6 +120,79 @@ def bench_cross_entropy(args: argparse.Namespace) -> list[dict]:
     return [
         {"op": "cross_entropy", "target": "ref", "mode": "forward_backward", "ms": cuda_time_ms(ref_step, args.warmup, args.iters)},
         {"op": "cross_entropy", "target": "triton", "mode": "forward_backward", "ms": cuda_time_ms(triton_step, args.warmup, args.iters)},
+    ]
+
+
+def bench_unembedding_cross_entropy(args: argparse.Namespace) -> list[dict]:
+    x = torch.randn(args.rows, args.hidden, device="cuda", dtype=torch.bfloat16, requires_grad=True)
+    weight = torch.randn(args.vocab, args.hidden, device="cuda", dtype=torch.bfloat16, requires_grad=True)
+    labels = torch.randint(0, args.vocab, (args.rows,), device="cuda")
+    labels[::17] = -100
+
+    def materialized_forward():
+        logits = triton_linear_forward_2d(x, weight, None, out_dtype=torch.bfloat16).float()
+        triton_cross_entropy(logits, labels)
+
+    def fused_forward():
+        triton_unembedding_cross_entropy(x, weight, labels)
+
+    def materialized_step():
+        x_, weight_ = fresh_like(x), fresh_like(weight)
+        logits = triton_linear(x_, weight_, None).float()
+        triton_cross_entropy(logits, labels).backward()
+
+    def fused_step():
+        x_, weight_ = fresh_like(x), fresh_like(weight)
+        triton_unembedding_cross_entropy(x_, weight_, labels).backward()
+
+    mat_forward_ms = cuda_time_ms(materialized_forward, args.warmup, args.iters)
+    fused_forward_ms = cuda_time_ms(fused_forward, args.warmup, args.iters)
+    mat_ms = cuda_time_ms(materialized_step, args.warmup, args.iters)
+    fused_ms = cuda_time_ms(fused_step, args.warmup, args.iters)
+    logits_bytes = args.rows * args.vocab * torch.tensor([], dtype=torch.bfloat16).element_size()
+    return [
+        {
+            "op": "unembedding_cross_entropy",
+            "target": "materialized_triton",
+            "mode": "forward",
+            "ms": mat_forward_ms,
+            "rows": args.rows,
+            "hidden": args.hidden,
+            "vocab": args.vocab,
+            "materialized_logits_bytes": logits_bytes,
+        },
+        {
+            "op": "unembedding_cross_entropy",
+            "target": "fused_triton",
+            "mode": "forward",
+            "ms": fused_forward_ms,
+            "speedup_vs_materialized": mat_forward_ms / fused_forward_ms,
+            "rows": args.rows,
+            "hidden": args.hidden,
+            "vocab": args.vocab,
+            "avoided_logits_bytes": logits_bytes,
+        },
+        {
+            "op": "unembedding_cross_entropy",
+            "target": "materialized_triton",
+            "mode": "forward_backward",
+            "ms": mat_ms,
+            "rows": args.rows,
+            "hidden": args.hidden,
+            "vocab": args.vocab,
+            "materialized_logits_bytes": logits_bytes,
+        },
+        {
+            "op": "unembedding_cross_entropy",
+            "target": "fused_triton",
+            "mode": "forward_backward",
+            "ms": fused_ms,
+            "speedup_vs_materialized": mat_ms / fused_ms,
+            "rows": args.rows,
+            "hidden": args.hidden,
+            "vocab": args.vocab,
+            "avoided_logits_bytes": logits_bytes,
+        },
     ]
 
 
@@ -413,6 +487,7 @@ def parse_args() -> argparse.Namespace:
             "all",
             "flash_attention",
             "cross_entropy",
+            "unembedding_cross_entropy",
             "matmul_top1",
             "gelu_mlp",
             "lora",
@@ -463,6 +538,7 @@ def main() -> None:
     benches = {
         "flash_attention": bench_flash_attention,
         "cross_entropy": bench_cross_entropy,
+        "unembedding_cross_entropy": bench_unembedding_cross_entropy,
         "matmul_top1": bench_matmul_top1,
         "gelu_mlp": bench_gelu_mlp,
         "lora": bench_lora,
