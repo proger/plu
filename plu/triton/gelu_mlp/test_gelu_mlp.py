@@ -10,6 +10,7 @@ import torch.nn.functional as F
 pytest.importorskip("triton")
 
 from plu.ref.gelu_mlp import gelu_mlp as ref_gelu_mlp
+from plu.triton.gelu_mlp.backward import linear_input_gelu_grad
 from plu.triton.gelu_mlp.forward import _gelu_mlp_forward
 from plu.triton.gelu_mlp import gelu_mlp as triton_gelu_mlp
 
@@ -145,3 +146,20 @@ def test_gelu_mlp_bf16_rounds_after_high_precision_gelu():
     torch.testing.assert_close(preact, ref_preact.to(torch.bfloat16), atol=5e-4, rtol=1e-2)
     torch.testing.assert_close(hidden, ref_hidden, atol=2e-2, rtol=1e-2)
     torch.testing.assert_close(out, ref_out, atol=1e-2, rtol=1e-2)
+
+
+def test_linear_input_gelu_grad_bf16_keeps_accumulator_fp32():
+    torch.manual_seed(0)
+    grad_out = torch.randn(5, 7, device="cuda", dtype=torch.bfloat16)
+    weight = torch.randn(7, 9, device="cuda", dtype=torch.bfloat16)
+    preact = torch.randn(5, 9, device="cuda", dtype=torch.bfloat16)
+
+    actual = linear_input_gelu_grad(grad_out, weight, preact)
+    preact_fp32 = preact.float()
+    gelu_grad = 0.5 * (1.0 + torch.erf(preact_fp32 / math.sqrt(2.0)))
+    gelu_grad += preact_fp32 * torch.exp(-0.5 * preact_fp32 * preact_fp32) / math.sqrt(2.0 * math.pi)
+    expected = ((grad_out.float() @ weight.float()) * gelu_grad).to(torch.bfloat16)
+    rounded_acc = (((grad_out.float() @ weight.float()).to(torch.bfloat16).float()) * gelu_grad).to(torch.bfloat16)
+
+    torch.testing.assert_close(actual, expected, atol=0, rtol=0)
+    assert not torch.equal(expected, rounded_acc)

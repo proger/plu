@@ -37,7 +37,6 @@ def _linear_input_gelu_grad_kernel(
     out_features: tl.constexpr,
     in_features: tl.constexpr,
     use_tf32: tl.constexpr,
-    round_grad_hidden: tl.constexpr,
     block_m: tl.constexpr,
     block_k: tl.constexpr,
     block_n: tl.constexpr,
@@ -74,10 +73,9 @@ def _linear_input_gelu_grad_kernel(
     inv_sqrt2pi = 0.3989422917366028
     cdf = 0.5 * (1.0 + libdevice.erf(preact * inv_sqrt2))
     pdf_term = libdevice.exp(-0.5 * preact * preact) * inv_sqrt2pi
-    grad_hidden = acc.to(tl.bfloat16).to(tl.float32) if round_grad_hidden else acc
     tl.store(
         grad_input_ptr + offs_m[:, None] * in_features + offs_k[None, :],
-        grad_hidden * (cdf + preact * pdf_term),
+        acc * (cdf + preact * pdf_term),
         mask=(offs_m[:, None] < rows) & (offs_k[None, :] < in_features),
     )
 
@@ -97,7 +95,6 @@ def _linear_input_gelu_grad_recompute_kernel(
     has_fc1_bias: tl.constexpr,
     use_tf32_grad: tl.constexpr,
     use_tf32_preact: tl.constexpr,
-    round_grad_hidden: tl.constexpr,
     block_m: tl.constexpr,
     block_h: tl.constexpr,
     block_n: tl.constexpr,
@@ -154,10 +151,9 @@ def _linear_input_gelu_grad_recompute_kernel(
     inv_sqrt2pi = 0.3989422917366028
     cdf = 0.5 * (1.0 + libdevice.erf(preact * inv_sqrt2))
     pdf_term = libdevice.exp(-0.5 * preact * preact) * inv_sqrt2pi
-    grad_hidden = grad_hidden_acc.to(tl.bfloat16).to(tl.float32) if round_grad_hidden else grad_hidden_acc
     tl.store(
         grad_input_ptr + offs_m[:, None] * hidden_features + offs_h[None, :],
-        grad_hidden * (cdf + preact * pdf_term),
+        grad_hidden_acc * (cdf + preact * pdf_term),
         mask=(offs_m[:, None] < rows) & (offs_h[None, :] < hidden_features),
     )
 
@@ -198,7 +194,6 @@ def linear_input_gelu_grad(grad_out: Tensor, weight: Tensor, preact: Tensor) -> 
         out_features,
         in_features,
         use_tf32,
-        grad_out.dtype == torch.bfloat16,
         block_m,
         block_k,
         block_n,
@@ -243,7 +238,6 @@ def linear_input_gelu_grad_recompute(
         fc1_bias is not None,
         use_tf32_grad,
         use_tf32_preact,
-        grad_out.dtype == torch.bfloat16,
         block_m,
         block_h,
         block_n,

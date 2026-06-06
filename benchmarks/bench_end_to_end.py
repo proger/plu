@@ -6,10 +6,12 @@ import os
 import subprocess
 import sys
 import time
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
 import torch
+import torch.nn.functional as F
 
 from plu.train_data import HOP_LENGTH, SAMPLE_RATE
 
@@ -73,6 +75,181 @@ def extend_encoder_positions(model: torch.nn.Module, positions: int) -> bool:
     return True
 
 
+@dataclass(frozen=True)
+class PackedMxLinear:
+    packed_weight: torch.Tensor
+    scale_codes: torch.Tensor
+    in_features: int
+    bias: torch.Tensor | None
+    format: str
+    bf16_storage_bytes: int
+    packed_storage_bytes: int
+
+    def __call__(self, x: torch.Tensor) -> torch.Tensor:
+        if self.format == "mxfp8":
+            from plu.triton.mx_linear import mxfp8_linear
+
+            return mxfp8_linear(x, self.packed_weight, self.scale_codes, self.in_features, self.bias)
+        if self.format == "mxfp4":
+            from plu.triton.mx_linear import mxfp4_linear
+
+            return mxfp4_linear(x, self.packed_weight, self.scale_codes, self.in_features, self.bias)
+        raise RuntimeError(f"unsupported packed MX format: {self.format}")
+
+
+def pack_mx_linear(module: torch.nn.Linear, format: str) -> PackedMxLinear:
+    from plu.triton.mx_linear import pack_mxfp4_weight, pack_mxfp8_weight
+
+    weight = module.weight.detach().contiguous()
+    bias = None if module.bias is None else module.bias.detach().contiguous()
+    if format == "mxfp8":
+        packed_weight, scale_codes, in_features = pack_mxfp8_weight(weight)
+    elif format == "mxfp4":
+        packed_weight, scale_codes, in_features = pack_mxfp4_weight(weight)
+    else:
+        raise RuntimeError(f"unsupported MX format: {format}")
+    bf16_storage_bytes = weight.numel() * weight.element_size()
+    packed_storage_bytes = packed_weight.numel() * packed_weight.element_size() + scale_codes.numel() * scale_codes.element_size()
+    return PackedMxLinear(packed_weight, scale_codes, in_features, bias, format, bf16_storage_bytes, packed_storage_bytes)
+
+
+def pack_mx_model(model: torch.nn.Module, format: str) -> tuple[dict[int, PackedMxLinear], dict[str, Any]]:
+    pack_start = time.perf_counter()
+    packed: dict[int, PackedMxLinear] = {}
+    for module in model.modules():
+        if module.__class__.__name__ == "CastLinear":
+            packed[id(module)] = pack_mx_linear(module, format)
+    pack_ms = (time.perf_counter() - pack_start) * 1000.0
+    bf16_bytes = sum(linear.bf16_storage_bytes for linear in packed.values())
+    packed_bytes = sum(linear.packed_storage_bytes for linear in packed.values())
+    stats = {
+        "mx_format": format,
+        "mx_pack_ms": pack_ms,
+        "mx_packed_linear_count": len(packed),
+        "mx_bf16_linear_weight_storage_bytes": bf16_bytes,
+        "mx_packed_linear_weight_storage_bytes": packed_bytes,
+        "mx_linear_weight_compression_vs_bf16": bf16_bytes / packed_bytes if packed_bytes else None,
+    }
+    return packed, stats
+
+
+def _packed_linear(packed: dict[int, PackedMxLinear], module: torch.nn.Module, x: torch.Tensor) -> torch.Tensor:
+    return packed[id(module)](x)
+
+
+def _packed_qkv(packed: dict[int, PackedMxLinear], module: torch.nn.Module, x: torch.Tensor, num_heads: int) -> torch.Tensor:
+    projected = _packed_linear(packed, module, x)
+    batch, seq_len, features = projected.shape
+    head_dim = features // num_heads
+    return projected.reshape(batch, seq_len, num_heads, head_dim).permute(0, 2, 1, 3).contiguous()
+
+
+def _packed_attention(
+    packed: dict[int, PackedMxLinear],
+    module: torch.nn.Module,
+    hidden_states: torch.Tensor,
+    key_value_states: torch.Tensor | None = None,
+    causal_mask: torch.Tensor | None = None,
+) -> torch.Tensor:
+    from plu.triton.flash_attention import flash_attention
+
+    source = hidden_states if key_value_states is None else key_value_states
+    query = _packed_qkv(packed, module.q_proj, hidden_states, module.num_heads)
+    key = _packed_qkv(packed, module.k_proj, source, module.num_heads)
+    value = _packed_qkv(packed, module.v_proj, source, module.num_heads)
+    attended = flash_attention(query, key, value, causal_mask)
+    batch, heads, seq_len, head_dim = attended.shape
+    merged = attended.permute(0, 2, 1, 3).contiguous().reshape(batch, seq_len, heads * head_dim)
+    return _packed_linear(packed, module.out_proj, merged)
+
+
+def _packed_gelu_mlp(
+    packed: dict[int, PackedMxLinear],
+    fc1: torch.nn.Module,
+    fc2: torch.nn.Module,
+    hidden_states: torch.Tensor,
+) -> torch.Tensor:
+    preact = _packed_linear(packed, fc1, hidden_states)
+    hidden = F.gelu(preact.float()).to(preact.dtype)
+    return _packed_linear(packed, fc2, hidden)
+
+
+def _packed_encoder_layer(packed: dict[int, PackedMxLinear], layer: torch.nn.Module, hidden_states: torch.Tensor) -> torch.Tensor:
+    from plu.triton.layer_norm import layer_norm
+    from plu.triton.residual_add import residual_add
+
+    residual = hidden_states
+    hidden_states = layer_norm(hidden_states, layer.self_attn_layer_norm.weight, layer.self_attn_layer_norm.bias, layer.self_attn_layer_norm.eps)
+    hidden_states = _packed_attention(packed, layer.self_attn, hidden_states)
+    hidden_states = residual_add(residual, hidden_states)
+
+    residual = hidden_states
+    hidden_states = layer_norm(hidden_states, layer.final_layer_norm.weight, layer.final_layer_norm.bias, layer.final_layer_norm.eps)
+    hidden_states = _packed_gelu_mlp(packed, layer.fc1, layer.fc2, hidden_states)
+    return residual_add(residual, hidden_states)
+
+
+def _packed_decoder_layer(
+    packed: dict[int, PackedMxLinear],
+    layer: torch.nn.Module,
+    hidden_states: torch.Tensor,
+    encoder_hidden_states: torch.Tensor,
+    causal_mask: torch.Tensor,
+) -> torch.Tensor:
+    from plu.triton.layer_norm import layer_norm
+    from plu.triton.residual_add import residual_add
+
+    residual = hidden_states
+    hidden_states = layer_norm(hidden_states, layer.self_attn_layer_norm.weight, layer.self_attn_layer_norm.bias, layer.self_attn_layer_norm.eps)
+    hidden_states = _packed_attention(packed, layer.self_attn, hidden_states, causal_mask=causal_mask)
+    hidden_states = residual_add(residual, hidden_states)
+
+    residual = hidden_states
+    hidden_states = layer_norm(hidden_states, layer.encoder_attn_layer_norm.weight, layer.encoder_attn_layer_norm.bias, layer.encoder_attn_layer_norm.eps)
+    hidden_states = _packed_attention(packed, layer.encoder_attn, hidden_states, key_value_states=encoder_hidden_states)
+    hidden_states = residual_add(residual, hidden_states)
+
+    residual = hidden_states
+    hidden_states = layer_norm(hidden_states, layer.final_layer_norm.weight, layer.final_layer_norm.bias, layer.final_layer_norm.eps)
+    hidden_states = _packed_gelu_mlp(packed, layer.fc1, layer.fc2, hidden_states)
+    return residual_add(residual, hidden_states)
+
+
+def packed_mx_forward(
+    model: torch.nn.Module,
+    packed: dict[int, PackedMxLinear],
+    input_features: torch.Tensor,
+    labels: torch.Tensor,
+) -> Any:
+    from plu.triton.conv1d_gelu import conv1d_gelu
+    from plu.triton.cross_entropy import cross_entropy
+    from plu.triton.embedding import decoder_embedding, encoder_position_embedding
+    from plu.triton.layer_norm import layer_norm
+    from plu.whisper import Seq2SeqOutput, shift_tokens_right
+
+    encoder = model.model.encoder
+    decoder = model.model.decoder
+    hidden_states = conv1d_gelu(input_features, encoder.conv1.weight, encoder.conv1.bias, encoder.conv1.stride[0], encoder.conv1.padding[0])
+    hidden_states = conv1d_gelu(hidden_states, encoder.conv2.weight, encoder.conv2.bias, encoder.conv2.stride[0], encoder.conv2.padding[0])
+    hidden_states = hidden_states.transpose(1, 2)
+    hidden_states = encoder_position_embedding(hidden_states, encoder.embed_positions.weight)
+    for layer in encoder.layers:
+        hidden_states = _packed_encoder_layer(packed, layer, hidden_states)
+    encoder_hidden_states = layer_norm(hidden_states, encoder.layer_norm.weight, encoder.layer_norm.bias, encoder.layer_norm.eps)
+
+    decoder_input_ids = shift_tokens_right(labels, model.config.pad_token_id, model.config.decoder_start_token_id)
+    if decoder_input_ids.shape[1] > decoder.config.max_target_positions:
+        decoder_input_ids = decoder_input_ids[:, -decoder.config.max_target_positions :]
+    hidden_states = decoder_embedding(decoder_input_ids, decoder.embed_tokens.weight, decoder.embed_positions.weight, encoder_hidden_states.dtype)
+    for layer in decoder.layers:
+        hidden_states = _packed_decoder_layer(packed, layer, hidden_states, encoder_hidden_states, decoder.causal_mask)
+    decoder_hidden_states = layer_norm(hidden_states, decoder.layer_norm.weight, decoder.layer_norm.bias, decoder.layer_norm.eps)
+
+    logits = _packed_linear(packed, model.proj_out, decoder_hidden_states).float()
+    loss = cross_entropy(logits, labels, ignore_index=-100)
+    return Seq2SeqOutput(loss=loss, logits=logits)
+
+
 def run_child(args: argparse.Namespace) -> dict[str, Any]:
     os.environ["PLU_OPS_BACKEND"] = args.child_backend
     if args.device.startswith("cuda") and not torch.cuda.is_available():
@@ -88,6 +265,10 @@ def run_child(args: argparse.Namespace) -> dict[str, Any]:
     dtype = parse_dtype(args.dtype)
     model = WhisperForConditionalGeneration.from_pretrained(args.model).to(device=args.device, dtype=dtype)
     model.train()
+    if args.mode == "forward":
+        model.eval()
+    if args.child_backend in {"mxfp8", "mxfp4"} and args.mode != "forward":
+        raise RuntimeError("MXFP end-to-end benchmark is forward-only until packed-weight backward kernels exist")
 
     encoder_tokens = encoder_tokens_after_conv(args.input_features)
     extended_positions = False
@@ -107,13 +288,25 @@ def run_child(args: argparse.Namespace) -> dict[str, Any]:
         dtype=dtype,
     )
     labels = torch.randint(model.config.vocab_size, (args.batch, args.decoder_len), device=args.device)
+    packed_mx: dict[int, PackedMxLinear] | None = None
+    mx_stats: dict[str, Any] = {}
+    if args.child_backend in {"mxfp8", "mxfp4"}:
+        packed_mx, mx_stats = pack_mx_model(model, args.child_backend)
 
     def step() -> tuple[torch.Tensor, torch.Size]:
-        model.zero_grad(set_to_none=True)
-        output = model(input_features, labels=labels)
+        if args.mode == "forward":
+            with torch.no_grad():
+                if packed_mx is not None:
+                    output = packed_mx_forward(model, packed_mx, input_features, labels)
+                else:
+                    output = model(input_features, labels=labels)
+        else:
+            model.zero_grad(set_to_none=True)
+            output = model(input_features, labels=labels)
         if output.loss is None:
             raise RuntimeError("expected loss for end-to-end benchmark")
-        output.loss.backward()
+        if args.mode == "forward_backward":
+            output.loss.backward()
         return output.loss.detach(), output.logits.shape
 
     times_ms: list[float] = []
@@ -163,7 +356,7 @@ def run_child(args: argparse.Namespace) -> dict[str, Any]:
     return {
         "op": "end_to_end",
         "target": args.child_backend,
-        "mode": "forward_backward_cuda_graph" if args.cuda_graph else "forward_backward",
+        "mode": f"{args.mode}_cuda_graph" if args.cuda_graph else args.mode,
         "cuda_graph": args.cuda_graph,
         "model": args.model,
         "dtype": str(dtype).replace("torch.", ""),
@@ -191,6 +384,7 @@ def run_child(args: argparse.Namespace) -> dict[str, Any]:
         "real_time_factor": mean_seconds / audio_secs,
         "loss": loss_value,
         "peak_allocated_gib": torch.cuda.max_memory_allocated() / 1024**3,
+        **mx_stats,
     }
 
 
@@ -214,6 +408,8 @@ def child_argv(args: argparse.Namespace, backend: str) -> list[str]:
         str(args.feature_fps),
         "--decoder-len",
         str(args.decoder_len),
+        "--mode",
+        args.mode,
         "--warmup",
         str(args.warmup),
         "--iters",
@@ -228,7 +424,10 @@ def child_argv(args: argparse.Namespace, backend: str) -> list[str]:
 
 
 def run_parent(args: argparse.Namespace) -> None:
-    backends = ["ref", "triton"] if args.backend == "all" else [args.backend]
+    if args.backend == "all":
+        backends = ["ref", "triton", "mxfp8", "mxfp4"] if args.mode == "forward" else ["ref", "triton"]
+    else:
+        backends = [args.backend]
     rows: list[dict[str, Any]] = []
     for backend in backends:
         env = os.environ.copy()
@@ -256,7 +455,7 @@ def run_parent(args: argparse.Namespace) -> None:
         summary = {
             "op": "end_to_end",
             "target": "summary",
-            "mode": "forward_backward_cuda_graph" if args.cuda_graph else "forward_backward",
+            "mode": f"{args.mode}_cuda_graph" if args.cuda_graph else args.mode,
             "cuda_graph": args.cuda_graph,
             "model": args.model,
             "dtype": by_target["triton"]["dtype"],
@@ -279,19 +478,47 @@ def run_parent(args: argparse.Namespace) -> None:
             "triton_peak_allocated_gib": by_target["triton"]["peak_allocated_gib"],
         }
         print(json.dumps(summary), flush=True)
+    baseline = by_target.get("triton") or by_target.get("ref")
+    if baseline is not None:
+        for target in ("mxfp8", "mxfp4"):
+            if target not in by_target:
+                continue
+            target_ms = by_target[target]["mean_ms"]
+            summary = {
+                "op": "end_to_end",
+                "target": f"summary_{target}",
+                "baseline": baseline["target"],
+                "mode": f"{args.mode}_cuda_graph" if args.cuda_graph else args.mode,
+                "cuda_graph": args.cuda_graph,
+                "model": args.model,
+                "dtype": by_target[target]["dtype"],
+                "batch": args.batch,
+                "input_features": args.input_features,
+                "decoder_tokens": args.decoder_len,
+                "baseline_mean_ms": baseline["mean_ms"],
+                "target_mean_ms": target_ms,
+                "speedup_vs_baseline": baseline["mean_ms"] / target_ms,
+                "baseline_x_real_time": baseline["x_real_time"],
+                "target_x_real_time": by_target[target]["x_real_time"],
+                "real_time_speedup_vs_baseline": by_target[target]["x_real_time"] / baseline["x_real_time"],
+                "baseline_peak_allocated_gib": baseline["peak_allocated_gib"],
+                "target_peak_allocated_gib": by_target[target]["peak_allocated_gib"],
+            }
+            print(json.dumps(summary), flush=True)
 
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Benchmark full PLU Whisper forward+backward passes.")
     parser.add_argument("--model", default="openai/whisper-large-v3-turbo", help="Local model path or Hugging Face repo id.")
-    parser.add_argument("--backend", choices=["all", "ref", "triton"], default="all")
-    parser.add_argument("--child-backend", choices=["ref", "triton"], default=None, help=argparse.SUPPRESS)
+    parser.add_argument("--backend", choices=["all", "ref", "triton", "mxfp8", "mxfp4"], default="all")
+    parser.add_argument("--child-backend", choices=["ref", "triton", "mxfp8", "mxfp4"], default=None, help=argparse.SUPPRESS)
     parser.add_argument("--device", default="cuda")
     parser.add_argument("--dtype", choices=["float32", "fp32", "bfloat16", "bf16"], default="float32")
     parser.add_argument("--batch", type=int, default=1)
     parser.add_argument("--input-features", type=int, default=3000, help="Input feature frames before Whisper conv downsampling.")
     parser.add_argument("--feature-fps", type=float, default=DEFAULT_FEATURE_FPS, help="Input feature frames per second of audio.")
     parser.add_argument("--decoder-len", type=int, default=448)
+    parser.add_argument("--mode", choices=["forward", "forward_backward"], default="forward_backward")
     parser.add_argument("--warmup", type=int, default=1)
     parser.add_argument("--iters", type=int, default=3)
     parser.add_argument("--seed", type=int, default=1234)
@@ -305,6 +532,8 @@ def parse_args() -> argparse.Namespace:
         raise ValueError("--warmup must be non-negative")
     if args.feature_fps <= 0:
         raise ValueError("--feature-fps must be positive")
+    if args.backend in {"mxfp8", "mxfp4"} and args.mode != "forward":
+        raise ValueError("MXFP end-to-end benchmark is forward-only; pass --mode forward")
     return args
 
 

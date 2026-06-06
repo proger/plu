@@ -30,6 +30,15 @@ from plu.triton.embedding import decoder_embedding as triton_decoder_embedding
 from plu.triton.embedding import encoder_position_embedding as triton_encoder_position_embedding
 from plu.triton.layer_norm import layer_norm as triton_layer_norm
 from plu.triton.linear import linear as triton_linear
+from plu.triton.linear.forward import linear_forward_2d as triton_linear_forward_2d
+from plu.triton.mx_linear import (
+    dequantize_mxfp4_weight,
+    dequantize_mxfp8_weight,
+    mxfp4_linear,
+    mxfp8_linear,
+    pack_mxfp4_weight,
+    pack_mxfp8_weight,
+)
 from plu.triton.qkv_proj import qkv_proj as triton_qkv_proj
 from plu.triton.residual_add import residual_add as triton_residual_add
 
@@ -206,6 +215,69 @@ def bench_linear(args: argparse.Namespace) -> list[dict]:
     ]
 
 
+def _rel_l2(actual: torch.Tensor, expected: torch.Tensor) -> float:
+    return float((actual.detach().float() - expected.detach().float()).norm() / expected.detach().float().norm().clamp_min(1e-12))
+
+
+def bench_mx_linear(args: argparse.Namespace) -> list[dict]:
+    x = torch.randn(args.rows, args.hidden, device="cuda", dtype=torch.bfloat16)
+    weight = (torch.randn(args.linear_out, args.hidden, device="cuda", dtype=torch.bfloat16) / (args.hidden**0.5)).contiguous()
+    bias = torch.zeros(args.linear_out, device="cuda", dtype=torch.bfloat16)
+    fp8_weight, fp8_scales, fp8_in_features = pack_mxfp8_weight(weight)
+    fp4_weight, fp4_scales, fp4_in_features = pack_mxfp4_weight(weight)
+
+    bf16_out = triton_linear_forward_2d(x, weight, bias)
+    fp8_out = mxfp8_linear(x, fp8_weight, fp8_scales, fp8_in_features, bias)
+    fp4_out = mxfp4_linear(x, fp4_weight, fp4_scales, fp4_in_features, bias)
+    fp8_dequant = dequantize_mxfp8_weight(fp8_weight, fp8_scales, fp8_in_features)
+    fp4_dequant = dequantize_mxfp4_weight(fp4_weight, fp4_scales, fp4_in_features)
+
+    bf16_ms = cuda_time_ms(lambda: triton_linear_forward_2d(x, weight, bias), args.warmup, args.iters)
+    fp8_ms = cuda_time_ms(lambda: mxfp8_linear(x, fp8_weight, fp8_scales, fp8_in_features, bias), args.warmup, args.iters)
+    fp4_ms = cuda_time_ms(lambda: mxfp4_linear(x, fp4_weight, fp4_scales, fp4_in_features, bias), args.warmup, args.iters)
+    bf16_bytes = weight.numel() * weight.element_size()
+    fp8_bytes = fp8_weight.numel() * fp8_weight.element_size() + fp8_scales.numel() * fp8_scales.element_size()
+    fp4_bytes = fp4_weight.numel() * fp4_weight.element_size() + fp4_scales.numel() * fp4_scales.element_size()
+
+    return [
+        {
+            "op": "mx_linear",
+            "target": "bf16",
+            "format": "bf16",
+            "mode": "forward",
+            "ms": bf16_ms,
+            "rows": args.rows,
+            "in_features": args.hidden,
+            "out_features": args.linear_out,
+            "weight_storage_bytes": bf16_bytes,
+        },
+        {
+            "op": "mx_linear",
+            "target": "mxfp8",
+            "format": "mxfp8_e4m3_e8m0_block32",
+            "mode": "forward",
+            "ms": fp8_ms,
+            "speedup_vs_bf16": bf16_ms / fp8_ms,
+            "rel_l2_vs_bf16_output": _rel_l2(fp8_out, bf16_out),
+            "rel_l2_weight": _rel_l2(fp8_dequant, weight),
+            "weight_storage_bytes": fp8_bytes,
+            "compression_vs_bf16": bf16_bytes / fp8_bytes,
+        },
+        {
+            "op": "mx_linear",
+            "target": "mxfp4",
+            "format": "mxfp4_e2m1_e8m0_block32",
+            "mode": "forward",
+            "ms": fp4_ms,
+            "speedup_vs_bf16": bf16_ms / fp4_ms,
+            "rel_l2_vs_bf16_output": _rel_l2(fp4_out, bf16_out),
+            "rel_l2_weight": _rel_l2(fp4_dequant, weight),
+            "weight_storage_bytes": fp4_bytes,
+            "compression_vs_bf16": bf16_bytes / fp4_bytes,
+        },
+    ]
+
+
 def bench_conv1d_gelu(args: argparse.Namespace) -> list[dict]:
     input_frames = args.input_frames or args.query_len * 2
     conv1_x = torch.randn(args.batch, args.mel_bins, input_frames, device="cuda", requires_grad=True)
@@ -351,6 +423,7 @@ def parse_args() -> argparse.Namespace:
             "gelu_mlp",
             "lora",
             "linear",
+            "mx_linear",
             "conv1d_gelu",
             "layer_norm",
             "qkv_proj",
@@ -400,6 +473,7 @@ def main() -> None:
         "gelu_mlp": bench_gelu_mlp,
         "lora": bench_lora,
         "linear": bench_linear,
+        "mx_linear": bench_mx_linear,
         "conv1d_gelu": bench_conv1d_gelu,
         "layer_norm": bench_layer_norm,
         "qkv_proj": bench_qkv_proj,
