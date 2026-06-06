@@ -32,8 +32,6 @@ from plu.triton.layer_norm import layer_norm as triton_layer_norm
 from plu.triton.linear import linear as triton_linear
 from plu.triton.linear.forward import linear_forward_2d as triton_linear_forward_2d
 from plu.triton.mx_linear import (
-    dequantize_mxfp4_weight,
-    dequantize_mxfp8_weight,
     mxfp4_linear,
     mxfp8_linear,
     pack_mxfp4_weight,
@@ -229,8 +227,6 @@ def bench_mx_linear(args: argparse.Namespace) -> list[dict]:
     bf16_out = triton_linear_forward_2d(x, weight, bias)
     fp8_out = mxfp8_linear(x, fp8_weight, fp8_scales, fp8_in_features, bias)
     fp4_out = mxfp4_linear(x, fp4_weight, fp4_scales, fp4_in_features, bias)
-    fp8_dequant = dequantize_mxfp8_weight(fp8_weight, fp8_scales, fp8_in_features)
-    fp4_dequant = dequantize_mxfp4_weight(fp4_weight, fp4_scales, fp4_in_features)
 
     bf16_ms = cuda_time_ms(lambda: triton_linear_forward_2d(x, weight, bias), args.warmup, args.iters)
     fp8_ms = cuda_time_ms(lambda: mxfp8_linear(x, fp8_weight, fp8_scales, fp8_in_features, bias), args.warmup, args.iters)
@@ -259,7 +255,6 @@ def bench_mx_linear(args: argparse.Namespace) -> list[dict]:
             "ms": fp8_ms,
             "speedup_vs_bf16": bf16_ms / fp8_ms,
             "rel_l2_vs_bf16_output": _rel_l2(fp8_out, bf16_out),
-            "rel_l2_weight": _rel_l2(fp8_dequant, weight),
             "weight_storage_bytes": fp8_bytes,
             "compression_vs_bf16": bf16_bytes / fp8_bytes,
         },
@@ -271,7 +266,6 @@ def bench_mx_linear(args: argparse.Namespace) -> list[dict]:
             "ms": fp4_ms,
             "speedup_vs_bf16": bf16_ms / fp4_ms,
             "rel_l2_vs_bf16_output": _rel_l2(fp4_out, bf16_out),
-            "rel_l2_weight": _rel_l2(fp4_dequant, weight),
             "weight_storage_bytes": fp4_bytes,
             "compression_vs_bf16": bf16_bytes / fp4_bytes,
         },

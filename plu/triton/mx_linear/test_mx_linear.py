@@ -9,10 +9,10 @@ import torch.nn.functional as F
 pytest.importorskip("triton")
 
 from plu.triton.mx_linear import (
-    dequantize_mxfp4_weight,
-    dequantize_mxfp8_weight,
     mxfp4_linear,
+    mxfp4_linear_with_master_weight,
     mxfp8_linear,
+    mxfp8_linear_with_master_weight,
     pack_mxfp4_weight,
     pack_mxfp8_weight,
 )
@@ -25,72 +25,142 @@ def _relative_l2(actual: torch.Tensor, expected: torch.Tensor) -> float:
     return float((actual.float() - expected.float()).norm() / expected.float().norm().clamp_min(1e-12))
 
 
-def test_mxfp8_pack_dequant_quality():
+def test_mxfp8_pack_layout():
     torch.manual_seed(0)
     weight = (torch.randn(37, 65, device="cuda", dtype=torch.bfloat16) / math.sqrt(65)).contiguous()
     packed, scales, in_features = pack_mxfp8_weight(weight)
-    dequant = dequantize_mxfp8_weight(packed, scales, in_features)
 
     assert packed.dtype == torch.float8_e4m3fn
     assert scales.dtype == torch.uint8
     assert packed.shape == (37, 96)
-    assert scales.shape == (37, 3)
+    assert scales.shape == (1, 1, 2, 2, 256)
     assert in_features == 65
-    assert _relative_l2(dequant, weight) < 3.5e-2
 
 
-def test_mxfp8_e5m2_pack_and_linear_match_dequantized_reference():
+def test_mxfp8_e5m2_pack_and_linear_matches_bf16_reference():
     torch.manual_seed(0)
     x = torch.randn(5, 65, device="cuda", dtype=torch.bfloat16)
     weight = (torch.randn(37, 65, device="cuda", dtype=torch.bfloat16) / math.sqrt(65)).contiguous()
     packed, scales, in_features = pack_mxfp8_weight(weight, element_format="e5m2")
-    dequant = dequantize_mxfp8_weight(packed, scales, in_features).to(x.dtype)
 
     assert packed.dtype == torch.float8_e5m2
-    assert _relative_l2(dequant, weight) < 7.0e-2
-    torch.testing.assert_close(mxfp8_linear(x, packed, scales, in_features), F.linear(x, dequant), atol=2e-3, rtol=2e-3)
+    assert _relative_l2(mxfp8_linear(x, packed, scales, in_features), F.linear(x, weight)) < 8.0e-2
 
 
-def test_mxfp4_pack_dequant_quality():
+def test_mxfp4_pack_layout():
     torch.manual_seed(0)
     weight = (torch.randn(37, 65, device="cuda", dtype=torch.bfloat16) / math.sqrt(65)).contiguous()
     packed, scales, in_features = pack_mxfp4_weight(weight)
-    dequant = dequantize_mxfp4_weight(packed, scales, in_features)
 
     assert packed.dtype == torch.uint8
     assert scales.dtype == torch.uint8
     assert packed.shape == (37, 48)
-    assert scales.shape == (37, 3)
+    assert scales.shape == (1, 1, 2, 2, 256)
     assert in_features == 65
-    assert _relative_l2(dequant, weight) < 1.8e-1
 
 
 @pytest.mark.parametrize("with_bias", [False, True])
-def test_mxfp8_linear_matches_dequantized_reference(with_bias: bool):
+def test_mxfp8_linear_matches_bf16_reference(with_bias: bool):
     torch.manual_seed(1)
     x = torch.randn(3, 7, 65, device="cuda", dtype=torch.bfloat16)
     weight = (torch.randn(37, 65, device="cuda", dtype=torch.bfloat16) / math.sqrt(65)).contiguous()
     bias = torch.randn(37, device="cuda", dtype=torch.bfloat16) if with_bias else None
     packed, scales, in_features = pack_mxfp8_weight(weight)
-    dequant = dequantize_mxfp8_weight(packed, scales, in_features).to(x.dtype)
 
-    ref = F.linear(x, dequant, bias)
+    ref = F.linear(x, weight, bias)
     out = mxfp8_linear(x, packed, scales, in_features, bias)
-    torch.testing.assert_close(out, ref, atol=2e-3, rtol=2e-3)
+    assert _relative_l2(out, ref) < 5.0e-2
 
 
 @pytest.mark.parametrize("with_bias", [False, True])
-def test_mxfp4_linear_matches_dequantized_reference(with_bias: bool):
+def test_mxfp4_linear_matches_bf16_reference(with_bias: bool):
     torch.manual_seed(2)
     x = torch.randn(3, 7, 65, device="cuda", dtype=torch.bfloat16)
     weight = (torch.randn(37, 65, device="cuda", dtype=torch.bfloat16) / math.sqrt(65)).contiguous()
     bias = torch.randn(37, device="cuda", dtype=torch.bfloat16) if with_bias else None
     packed, scales, in_features = pack_mxfp4_weight(weight)
-    dequant = dequantize_mxfp4_weight(packed, scales, in_features).to(x.dtype)
 
-    ref = F.linear(x, dequant, bias)
+    ref = F.linear(x, weight, bias)
     out = mxfp4_linear(x, packed, scales, in_features, bias)
-    torch.testing.assert_close(out, ref, atol=2e-3, rtol=2e-3)
+    assert _relative_l2(out, ref) < 2.5e-1
+
+
+@pytest.mark.parametrize("format_name", ["mxfp8", "mxfp4"])
+@pytest.mark.parametrize("with_bias", [False, True])
+def test_mxfp_linear_backward_matches_bf16_reference(format_name: str, with_bias: bool):
+    torch.manual_seed(4)
+    x = torch.randn(3, 7, 65, device="cuda", dtype=torch.bfloat16, requires_grad=True)
+    weight = (torch.randn(37, 65, device="cuda", dtype=torch.bfloat16) / math.sqrt(65)).contiguous()
+    bias = torch.randn(37, device="cuda", dtype=torch.bfloat16, requires_grad=True) if with_bias else None
+
+    if format_name == "mxfp8":
+        packed, scales, in_features = pack_mxfp8_weight(weight)
+        input_grad_packed, input_grad_scales, input_grad_in_features = pack_mxfp8_weight(weight.T.contiguous())
+        out = mxfp8_linear(x, packed, scales, in_features, bias, input_grad_packed, input_grad_scales, input_grad_in_features)
+        grad_threshold = 5.0e-2
+    else:
+        packed, scales, in_features = pack_mxfp4_weight(weight)
+        input_grad_packed, input_grad_scales, input_grad_in_features = pack_mxfp4_weight(weight.T.contiguous())
+        out = mxfp4_linear(x, packed, scales, in_features, bias, input_grad_packed, input_grad_scales, input_grad_in_features)
+        grad_threshold = 2.5e-1
+
+    grad = torch.randn_like(out)
+    out.backward(grad)
+    expected_x_grad = F.linear(grad.reshape(-1, 37), weight.T.to(grad.dtype)).reshape_as(x)
+    assert _relative_l2(x.grad, expected_x_grad) < grad_threshold
+    if with_bias:
+        expected_bias_grad = grad.reshape(-1, 37).float().sum(dim=0).to(torch.bfloat16)
+        torch.testing.assert_close(bias.grad, expected_bias_grad, atol=2e-3, rtol=2e-3)
+
+
+@pytest.mark.parametrize("format_name", ["mxfp8", "mxfp4"])
+@pytest.mark.parametrize("with_bias", [False, True])
+def test_mxfp_linear_with_master_weight_backward_matches_linear_gradients(format_name: str, with_bias: bool):
+    torch.manual_seed(5)
+    x = torch.randn(3, 7, 65, device="cuda", dtype=torch.bfloat16, requires_grad=True)
+    master_weight = (torch.randn(37, 65, device="cuda", dtype=torch.bfloat16) / math.sqrt(65)).contiguous().requires_grad_()
+    bias = torch.randn(37, device="cuda", dtype=torch.bfloat16, requires_grad=True) if with_bias else None
+
+    if format_name == "mxfp8":
+        packed, scales, in_features = pack_mxfp8_weight(master_weight.detach())
+        input_grad_packed, input_grad_scales, input_grad_in_features = pack_mxfp8_weight(master_weight.detach().T.contiguous())
+        out = mxfp8_linear_with_master_weight(
+            x,
+            packed,
+            scales,
+            in_features,
+            master_weight,
+            bias,
+            input_grad_packed,
+            input_grad_scales,
+            input_grad_in_features,
+        )
+        grad_threshold = 5.0e-2
+    else:
+        packed, scales, in_features = pack_mxfp4_weight(master_weight.detach())
+        input_grad_packed, input_grad_scales, input_grad_in_features = pack_mxfp4_weight(master_weight.detach().T.contiguous())
+        out = mxfp4_linear_with_master_weight(
+            x,
+            packed,
+            scales,
+            in_features,
+            master_weight,
+            bias,
+            input_grad_packed,
+            input_grad_scales,
+            input_grad_in_features,
+        )
+        grad_threshold = 2.5e-1
+
+    grad = torch.randn_like(out)
+    out.backward(grad)
+    expected_x_grad = F.linear(grad.reshape(-1, 37), master_weight.detach().T.to(grad.dtype)).reshape_as(x)
+    expected_w_grad = (grad.reshape(-1, 37).float().T @ x.detach().reshape(-1, 65).float()).to(torch.bfloat16)
+    assert _relative_l2(x.grad, expected_x_grad) < grad_threshold
+    torch.testing.assert_close(master_weight.grad, expected_w_grad, atol=2e-3, rtol=2e-3)
+    if with_bias:
+        expected_bias_grad = grad.reshape(-1, 37).float().sum(dim=0).to(torch.bfloat16)
+        torch.testing.assert_close(bias.grad, expected_bias_grad, atol=2e-3, rtol=2e-3)
 
 
 def test_mxfp_linear_reports_quantization_error_against_original_weight():
