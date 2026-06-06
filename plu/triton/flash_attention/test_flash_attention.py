@@ -34,3 +34,23 @@ def test_flash_attention_forward_backward(causal):
     triton_out.backward(grad)
     for ref_arg, triton_arg in zip((query, key, value), triton_args):
         torch.testing.assert_close(triton_arg.grad, ref_arg.grad, atol=5e-5, rtol=5e-5)
+
+
+@pytest.mark.parametrize("causal", [False, True])
+def test_flash_attention_bf16_forward_backward(causal):
+    torch.manual_seed(0)
+    query = torch.randn(2, 3, 5, 16, device="cuda", dtype=torch.bfloat16, requires_grad=True)
+    key = torch.randn(2, 3, 5, 16, device="cuda", dtype=torch.bfloat16, requires_grad=True)
+    value = torch.randn(2, 3, 5, 16, device="cuda", dtype=torch.bfloat16, requires_grad=True)
+    triton_args = _clone_args(query, key, value)
+    mask = torch.empty(5, 5, device="cuda").fill_(-float("inf")).triu_(1) if causal else None
+
+    ref_out = ref_flash_attention(query, key, value, mask)
+    triton_out = triton_flash_attention(*triton_args, mask)
+    torch.testing.assert_close(triton_out, ref_out, atol=4e-2, rtol=4e-2)
+
+    grad = torch.randn_like(ref_out)
+    ref_out.backward(grad)
+    triton_out.backward(grad)
+    for ref_arg, triton_arg in zip((query, key, value), triton_args):
+        torch.testing.assert_close(triton_arg.grad, ref_arg.grad, atol=6e-2, rtol=6e-2)

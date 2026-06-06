@@ -5,4 +5,5 @@ from torch import Tensor
 
 
 def layer_norm(x: Tensor, weight: Tensor, bias: Tensor | None, eps: float) -> Tensor:
-    return F.layer_norm(x.float(), (weight.shape[0],), weight, bias, eps).to(x.dtype)
+    bias_float = None if bias is None else bias.float()
+    return F.layer_norm(x.float(), (weight.shape[0],), weight.float(), bias_float, eps).to(x.dtype)

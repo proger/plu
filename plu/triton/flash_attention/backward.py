@@ -91,7 +91,7 @@ def _flash_attention_backward_kernel(
     if causal:
         probs = tl.where(offs_m[:, None] >= offs_n[None, :], probs, 0.0)
 
-    grad_value = tl.dot(tl.trans(probs), grad_out, input_precision="ieee")
+    grad_value = tl.dot(tl.trans(probs), grad_out.to(tl.float32), input_precision="ieee")
     grad_probs = tl.dot(grad_out, tl.trans(v), input_precision="ieee")
     delta = tl.load(delta_ptr + pid_bh * query_len + offs_m, mask=offs_m < query_len, other=0.0).to(tl.float32)
     grad_scores = probs * (grad_probs - delta[:, None])
@@ -99,8 +99,8 @@ def _flash_attention_backward_kernel(
     if causal:
         grad_scores = tl.where(offs_m[:, None] >= offs_n[None, :], grad_scores, 0.0)
 
-    grad_query = tl.dot(grad_scores, k, input_precision="ieee") * scale
-    grad_key = tl.dot(tl.trans(grad_scores), q, input_precision="ieee") * scale
+    grad_query = tl.dot(grad_scores, k.to(tl.float32), input_precision="ieee") * scale
+    grad_key = tl.dot(tl.trans(grad_scores), q.to(tl.float32), input_precision="ieee") * scale
 
     q_offsets = q_base + offs_m[:, None] * head_dim + offs_d[None, :]
     k_offsets = k_base + offs_n[:, None] * head_dim + offs_d[None, :]
@@ -172,4 +172,3 @@ def flash_attention_backward(
         num_warps=4,
     )
     return grad_query.reshape_as(query), grad_key.reshape_as(key), grad_value.reshape_as(value)
-

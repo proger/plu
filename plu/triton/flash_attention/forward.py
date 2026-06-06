@@ -67,7 +67,7 @@ def _flash_attention_forward_kernel(
             mask=(n[:, None] < key_len) & (offs_d[None, :] < head_dim),
             other=0.0,
         )
-        acc = acc * alpha[:, None] + tl.dot(probs, value, input_precision="ieee")
+        acc = acc * alpha[:, None] + tl.dot(probs, value.to(tl.float32), input_precision="ieee")
         row_sum = row_sum * alpha + tl.sum(probs, axis=1)
         row_max = new_row_max
 
