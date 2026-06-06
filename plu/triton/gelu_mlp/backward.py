@@ -217,13 +217,13 @@ def linear_input_gelu_grad_recompute(
     if rows == 0:
         return grad_input
 
-    use_large_tiles = rows >= 512 and out_features >= 512 and hidden_features >= 256 and input_features >= 256
+    use_large_tiles = rows >= 128 and out_features >= 512 and hidden_features >= 512 and input_features >= 512
     use_tf32_grad = use_large_tiles and grad_out.dtype == torch.float32 and fc2_weight.dtype == torch.float32
     use_tf32_preact = use_large_tiles and x.dtype == torch.float32 and fc1_weight.dtype == torch.float32
     block_m = 64 if use_large_tiles else 16
     block_h = 128 if use_large_tiles else 32
-    block_n = 32
-    block_i = 32
+    block_n = 64 if use_large_tiles else 32
+    block_i = 64 if use_large_tiles else 32
     _linear_input_gelu_grad_recompute_kernel[(triton.cdiv(rows, block_m), triton.cdiv(hidden_features, block_h))](
         grad_out,
         fc2_weight,

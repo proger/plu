@@ -196,7 +196,7 @@ def linear_input_grad(grad_out: Tensor, weight: Tensor, out_dtype: torch.dtype |
     grad_input = torch.empty((rows, in_features), device=grad_out.device, dtype=grad_out.dtype if out_dtype is None else out_dtype)
     if rows == 0:
         return grad_input
-    use_large_tiles = rows >= 512 and out_features >= 512 and in_features >= 256
+    use_large_tiles = rows >= 128 and out_features >= 512 and in_features >= 512
     cast_grad_to_float = grad_out.dtype != weight.dtype and grad_out.dtype != torch.float32
     cast_weight_to_float = grad_out.dtype != weight.dtype and weight.dtype != torch.float32
     inputs_are_fp32 = (grad_out.dtype == torch.float32 or cast_grad_to_float) and (
@@ -205,7 +205,7 @@ def linear_input_grad(grad_out: Tensor, weight: Tensor, out_dtype: torch.dtype |
     use_tf32 = inputs_are_fp32 and (use_large_tiles or cast_grad_to_float or cast_weight_to_float)
     block_m = 64 if use_large_tiles else 16
     block_k = 128 if use_large_tiles else 32
-    block_n = 32
+    block_n = 32 if not use_large_tiles or out_features >= 16384 else 64
     _linear_input_grad_kernel[(triton.cdiv(rows, block_m), triton.cdiv(in_features, block_k))](
         grad_out,
         weight,
