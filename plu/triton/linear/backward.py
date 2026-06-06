@@ -262,6 +262,8 @@ def linear_weight_bias_grad(grad_out: Tensor, x: Tensor, has_bias: bool, dtype: 
         block_k = 32
         block_m = 32
     if use_reduce_kernel:
+        inputs_are_bf16 = grad_out.dtype == torch.bfloat16 and x.dtype == torch.bfloat16
+        num_stages = 1 if inputs_are_bf16 and fold_bias_grad else 3
         _linear_weight_grad_reduce_kernel[(triton.cdiv(out_features, block_n), triton.cdiv(in_features, block_k))](
             grad_out,
             x,
@@ -278,6 +280,7 @@ def linear_weight_bias_grad(grad_out: Tensor, x: Tensor, has_bias: bool, dtype: 
             block_k,
             block_m,
             num_warps=4,
+            num_stages=num_stages,
         )
     else:
         _linear_weight_grad_kernel[
