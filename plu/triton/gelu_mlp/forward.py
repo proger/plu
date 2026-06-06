@@ -6,7 +6,7 @@ import triton.language as tl
 from triton.language.extra.cuda import libdevice
 from torch import Tensor
 
-from plu.triton.gelu_mlp.backward import linear_input_gelu_grad
+from plu.triton.gelu_mlp.backward import linear_input_gelu_grad_recompute
 from plu.triton.linear.backward import linear_input_grad, linear_weight_bias_grad
 
 
@@ -117,7 +117,7 @@ def _gelu_mlp_forward(
     hidden_features = fc1_weight.shape[0]
     out_features = fc2_weight.shape[0]
     preact = torch.empty((rows, hidden_features), device=x_2d.device, dtype=x_2d.dtype)
-    hidden = torch.empty_like(preact)
+    hidden = torch.empty((rows, hidden_features), device=x_2d.device, dtype=x_2d.dtype)
     out = torch.empty((rows, out_features), device=x_2d.device, dtype=x_2d.dtype)
     if rows == 0:
         return out, preact, hidden
@@ -173,7 +173,9 @@ class _TritonGeluMlp(torch.autograd.Function):
         fc1_bias = None if fc1_bias is None else fc1_bias.contiguous()
         fc2_bias = None if fc2_bias is None else fc2_bias.contiguous()
         out, preact, hidden = _gelu_mlp_forward(x_2d, fc1_weight, fc1_bias, fc2_weight, fc2_bias)
-        ctx.save_for_backward(x_2d, fc1_weight, fc2_weight, preact, hidden)
+        del preact
+        fc1_bias_saved = fc1_bias if fc1_bias is not None else x_2d.new_empty(0)
+        ctx.save_for_backward(x_2d, fc1_weight, fc2_weight, hidden, fc1_bias_saved)
         ctx.has_fc1_bias = fc1_bias is not None
         ctx.has_fc2_bias = fc2_bias is not None
         ctx.original_x_shape = original_x_shape
@@ -181,11 +183,12 @@ class _TritonGeluMlp(torch.autograd.Function):
 
     @staticmethod
     def backward(ctx, grad_out: Tensor):
-        x_2d, fc1_weight, fc2_weight, preact, hidden = ctx.saved_tensors
+        x_2d, fc1_weight, fc2_weight, hidden, fc1_bias_saved = ctx.saved_tensors
+        fc1_bias = fc1_bias_saved if ctx.has_fc1_bias else None
         grad_out_2d = grad_out.contiguous().reshape(-1, fc2_weight.shape[0])
         grad_fc2_weight, grad_fc2_bias = linear_weight_bias_grad(grad_out_2d, hidden, ctx.has_fc2_bias, dtype=fc2_weight.dtype)
-        grad_preact = linear_input_gelu_grad(grad_out_2d, fc2_weight, preact)
-        grad_x = linear_input_grad(grad_preact, fc1_weight)
+        grad_preact = linear_input_gelu_grad_recompute(grad_out_2d, fc2_weight, x_2d, fc1_weight, fc1_bias)
+        grad_x = linear_input_grad(grad_preact, fc1_weight, out_dtype=x_2d.dtype)
         grad_fc1_weight, grad_fc1_bias = linear_weight_bias_grad(grad_preact, x_2d, ctx.has_fc1_bias, dtype=fc1_weight.dtype)
         return grad_x.reshape(ctx.original_x_shape), grad_fc1_weight, grad_fc1_bias, grad_fc2_weight, grad_fc2_bias
 

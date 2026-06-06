@@ -5,10 +5,12 @@ import math
 
 import pytest
 import torch
+import torch.nn.functional as F
 
 pytest.importorskip("triton")
 
 from plu.ref.gelu_mlp import gelu_mlp as ref_gelu_mlp
+from plu.triton.gelu_mlp.forward import _gelu_mlp_forward
 from plu.triton.gelu_mlp import gelu_mlp as triton_gelu_mlp
 
 
@@ -99,3 +101,47 @@ def test_gelu_mlp_large_tf32_forward_backward():
                 "b2": (5e-5, 7e-3),
             },
         )
+
+
+def test_gelu_mlp_bf16_matches_high_precision_reference():
+    torch.manual_seed(0)
+    x = torch.randn(4, 9, 17, device="cuda", dtype=torch.bfloat16, requires_grad=True)
+    w1 = torch.randn(31, 17, device="cuda", dtype=torch.bfloat16, requires_grad=True)
+    b1 = torch.randn(31, device="cuda", dtype=torch.bfloat16, requires_grad=True)
+    w2 = torch.randn(13, 31, device="cuda", dtype=torch.bfloat16, requires_grad=True)
+    b2 = torch.randn(13, device="cuda", dtype=torch.bfloat16, requires_grad=True)
+    triton_args = _clone_args(x, w1, b1, w2, b2)
+
+    ref_out = ref_gelu_mlp(x, w1, b1, w2, b2)
+    triton_out = triton_gelu_mlp(*triton_args)
+    torch.testing.assert_close(triton_out, ref_out, atol=2e-4, rtol=1e-4)
+
+    grad = torch.randn_like(ref_out)
+    ref_out.backward(grad)
+    triton_out.backward(grad)
+    _assert_grads_close(
+        (x, w1, b1, w2, b2),
+        triton_args,
+        ("x", "w1", "b1", "w2", "b2"),
+        atol=3e-1,
+        rtol=1e-2,
+    )
+
+
+def test_gelu_mlp_bf16_rounds_after_high_precision_gelu():
+    torch.manual_seed(0)
+    x = torch.randn(64, 128, device="cuda", dtype=torch.bfloat16)
+    w1 = (torch.randn(512, 128, device="cuda", dtype=torch.bfloat16) / math.sqrt(128)).to(torch.bfloat16)
+    b1 = torch.zeros(512, device="cuda", dtype=torch.bfloat16)
+    w2 = (torch.randn(128, 512, device="cuda", dtype=torch.bfloat16) / math.sqrt(512)).to(torch.bfloat16)
+    b2 = torch.zeros(128, device="cuda", dtype=torch.bfloat16)
+
+    out, preact, hidden = _gelu_mlp_forward(x, w1, b1, w2, b2)
+    ref_preact = F.linear(x.float(), w1.float(), b1.float())
+    ref_hidden = F.gelu(ref_preact).to(torch.bfloat16)
+    ref_out = F.linear(ref_hidden, w2, b2)
+
+    assert preact.dtype == torch.bfloat16
+    torch.testing.assert_close(preact, ref_preact.to(torch.bfloat16), atol=5e-4, rtol=1e-2)
+    torch.testing.assert_close(hidden, ref_hidden, atol=2e-2, rtol=1e-2)
+    torch.testing.assert_close(out, ref_out, atol=1e-2, rtol=1e-2)

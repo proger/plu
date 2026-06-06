@@ -7,6 +7,7 @@ from torch import Tensor
 
 from plu.triton.gelu_mlp.backward import gelu_backward
 from plu.triton.linear.backward import linear_input_grad, linear_weight_bias_grad
+from plu.triton.linear.forward import linear_forward_2d
 
 
 @triton.jit
@@ -81,7 +82,7 @@ def conv1d_gelu_backward(
     grad_out: Tensor,
     cols: Tensor,
     weight_2d: Tensor,
-    preact: Tensor,
+    bias: Tensor | None,
     input_shape: torch.Size,
     weight_shape: torch.Size,
     has_bias: bool,
@@ -90,8 +91,10 @@ def conv1d_gelu_backward(
     padding: int,
 ) -> tuple[Tensor, Tensor, Tensor | None]:
     grad_out_2d = _conv_to_linear_layout(grad_out.contiguous())
+    preact_dtype = torch.float32 if cols.dtype == torch.bfloat16 else cols.dtype
+    preact = linear_forward_2d(cols, weight_2d, bias, out_dtype=preact_dtype)
     grad_preact = gelu_backward(preact, grad_out_2d)
-    grad_cols = linear_input_grad(grad_preact, weight_2d)
+    grad_cols = linear_input_grad(grad_preact, weight_2d, out_dtype=cols.dtype)
     grad_weight_2d, grad_bias = linear_weight_bias_grad(grad_preact, cols, has_bias, dtype=weight_2d.dtype)
     grad_x = torch.zeros(input_shape, device=grad_out.device, dtype=grad_out.dtype)
     total = grad_cols.numel()

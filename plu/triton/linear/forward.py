@@ -55,10 +55,10 @@ def _linear_forward_kernel(
     )
 
 
-def linear_forward_2d(x_2d: Tensor, weight: Tensor, bias: Tensor | None) -> Tensor:
+def linear_forward_2d(x_2d: Tensor, weight: Tensor, bias: Tensor | None, out_dtype: torch.dtype | None = None) -> Tensor:
     rows, in_features = x_2d.shape
     out_features = weight.shape[0]
-    out = torch.empty((rows, out_features), device=x_2d.device, dtype=x_2d.dtype)
+    out = torch.empty((rows, out_features), device=x_2d.device, dtype=x_2d.dtype if out_dtype is None else out_dtype)
     if rows == 0:
         return out
     use_large_tiles = rows >= 512 and in_features >= 256 and out_features >= 512 and x_2d.dtype == torch.float32

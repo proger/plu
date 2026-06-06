@@ -32,3 +32,21 @@ def test_conv1d_gelu_forward_backward():
     triton_out.backward(grad)
     for ref_arg, triton_arg in zip((x, weight, bias), triton_args):
         torch.testing.assert_close(triton_arg.grad, ref_arg.grad, atol=1e-5, rtol=1e-5)
+
+
+def test_conv1d_gelu_bf16_forward_backward():
+    torch.manual_seed(0)
+    x = torch.randn(2, 3, 9, device="cuda", dtype=torch.bfloat16, requires_grad=True)
+    weight = torch.randn(5, 3, 3, device="cuda", dtype=torch.bfloat16, requires_grad=True)
+    bias = torch.randn(5, device="cuda", dtype=torch.bfloat16, requires_grad=True)
+    triton_args = _clone_args(x, weight, bias)
+
+    ref_out = ref_conv1d_gelu(x, weight, bias, stride=2, padding=1)
+    triton_out = triton_conv1d_gelu(*triton_args, stride=2, padding=1)
+    torch.testing.assert_close(triton_out, ref_out, atol=4e-2, rtol=2e-2)
+
+    grad = torch.randn_like(ref_out)
+    ref_out.backward(grad)
+    triton_out.backward(grad)
+    for ref_arg, triton_arg in zip((x, weight, bias), triton_args):
+        torch.testing.assert_close(triton_arg.grad, ref_arg.grad, atol=4e-2, rtol=2e-2)

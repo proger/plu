@@ -15,6 +15,8 @@ def _linear_input_grad_kernel(
     out_features: tl.constexpr,
     in_features: tl.constexpr,
     use_tf32: tl.constexpr,
+    cast_grad_to_float: tl.constexpr,
+    cast_weight_to_float: tl.constexpr,
     block_m: tl.constexpr,
     block_k: tl.constexpr,
     block_n: tl.constexpr,
@@ -37,6 +39,10 @@ def _linear_input_grad_kernel(
             mask=(n[:, None] < out_features) & (offs_k[None, :] < in_features),
             other=0.0,
         )
+        if cast_grad_to_float:
+            grad = grad.to(tl.float32)
+        if cast_weight_to_float:
+            weight = weight.to(tl.float32)
         if use_tf32:
             acc += tl.dot(grad, weight, input_precision="tf32")
         else:
@@ -57,6 +63,8 @@ def _linear_weight_grad_kernel(
     out_features: tl.constexpr,
     in_features: tl.constexpr,
     use_tf32: tl.constexpr,
+    cast_grad_to_float: tl.constexpr,
+    cast_input_to_float: tl.constexpr,
     block_n: tl.constexpr,
     block_k: tl.constexpr,
     block_m: tl.constexpr,
@@ -77,6 +85,10 @@ def _linear_weight_grad_kernel(
         mask=(offs_m[:, None] < rows) & (offs_k[None, :] < in_features),
         other=0.0,
     )
+    if cast_grad_to_float:
+        grad = grad.to(tl.float32)
+    if cast_input_to_float:
+        x = x.to(tl.float32)
     if use_tf32:
         acc = tl.dot(tl.trans(grad), x, input_precision="tf32")
     else:
@@ -98,6 +110,8 @@ def _linear_weight_grad_reduce_kernel(
     out_features: tl.constexpr,
     in_features: tl.constexpr,
     use_tf32: tl.constexpr,
+    cast_grad_to_float: tl.constexpr,
+    cast_input_to_float: tl.constexpr,
     block_n: tl.constexpr,
     block_k: tl.constexpr,
     block_m: tl.constexpr,
@@ -120,6 +134,10 @@ def _linear_weight_grad_reduce_kernel(
             mask=(m[:, None] < rows) & (offs_k[None, :] < in_features),
             other=0.0,
         )
+        if cast_grad_to_float:
+            grad = grad.to(tl.float32)
+        if cast_input_to_float:
+            x = x.to(tl.float32)
         if use_tf32:
             acc += tl.dot(tl.trans(grad), x, input_precision="tf32")
         else:
@@ -153,14 +171,19 @@ def _linear_bias_grad_kernel(
     tl.atomic_add(grad_bias_ptr + offs_n, acc, sem="relaxed", mask=offs_n < out_features)
 
 
-def linear_input_grad(grad_out: Tensor, weight: Tensor) -> Tensor:
+def linear_input_grad(grad_out: Tensor, weight: Tensor, out_dtype: torch.dtype | None = None) -> Tensor:
     rows, out_features = grad_out.shape
     in_features = weight.shape[1]
-    grad_input = torch.empty((rows, in_features), device=grad_out.device, dtype=grad_out.dtype)
+    grad_input = torch.empty((rows, in_features), device=grad_out.device, dtype=grad_out.dtype if out_dtype is None else out_dtype)
     if rows == 0:
         return grad_input
     use_large_tiles = rows >= 512 and out_features >= 512 and in_features >= 256
-    use_tf32 = use_large_tiles and grad_out.dtype == torch.float32 and weight.dtype == torch.float32
+    cast_grad_to_float = grad_out.dtype != weight.dtype and grad_out.dtype != torch.float32
+    cast_weight_to_float = grad_out.dtype != weight.dtype and weight.dtype != torch.float32
+    inputs_are_fp32 = (grad_out.dtype == torch.float32 or cast_grad_to_float) and (
+        weight.dtype == torch.float32 or cast_weight_to_float
+    )
+    use_tf32 = inputs_are_fp32 and (use_large_tiles or cast_grad_to_float or cast_weight_to_float)
     block_m = 64 if use_large_tiles else 16
     block_k = 128 if use_large_tiles else 32
     block_n = 32
@@ -172,6 +195,8 @@ def linear_input_grad(grad_out: Tensor, weight: Tensor) -> Tensor:
         out_features,
         in_features,
         use_tf32,
+        cast_grad_to_float,
+        cast_weight_to_float,
         block_m,
         block_k,
         block_n,
@@ -185,7 +210,10 @@ def linear_weight_bias_grad(grad_out: Tensor, x: Tensor, has_bias: bool, dtype: 
     in_features = x.shape[1]
     grad_dtype = grad_out.dtype if dtype is None else dtype
     use_large_tiles = rows >= 512 and out_features >= 512 and in_features >= 256
-    use_tf32 = use_large_tiles and grad_out.dtype == torch.float32 and x.dtype == torch.float32
+    cast_grad_to_float = grad_out.dtype != x.dtype and grad_out.dtype != torch.float32
+    cast_input_to_float = grad_out.dtype != x.dtype and x.dtype != torch.float32
+    inputs_are_fp32 = (grad_out.dtype == torch.float32 or cast_grad_to_float) and (x.dtype == torch.float32 or cast_input_to_float)
+    use_tf32 = inputs_are_fp32 and (use_large_tiles or cast_grad_to_float or cast_input_to_float)
     if use_large_tiles:
         grad_weight = torch.empty((out_features, in_features), device=grad_out.device, dtype=grad_dtype)
     else:
@@ -207,6 +235,8 @@ def linear_weight_bias_grad(grad_out: Tensor, x: Tensor, has_bias: bool, dtype: 
             out_features,
             in_features,
             use_tf32,
+            cast_grad_to_float,
+            cast_input_to_float,
             block_n,
             block_k,
             block_m,
@@ -223,6 +253,8 @@ def linear_weight_bias_grad(grad_out: Tensor, x: Tensor, has_bias: bool, dtype: 
             out_features,
             in_features,
             use_tf32,
+            cast_grad_to_float,
+            cast_input_to_float,
             block_n,
             block_k,
             block_m,
