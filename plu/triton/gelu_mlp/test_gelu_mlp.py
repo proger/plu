@@ -42,10 +42,11 @@ def _clone_args(*args):
     return [arg.detach().clone().requires_grad_(arg.requires_grad) if torch.is_tensor(arg) else arg for arg in args]
 
 
-def _assert_grads_close(ref_args, triton_args, names, atol=5e-5, rtol=5e-5):
+def _assert_grads_close(ref_args, triton_args, names, atol=5e-5, rtol=5e-5, tolerances=None):
     for name, ref_arg, triton_arg in zip(names, ref_args, triton_args):
         if torch.is_tensor(ref_arg) and ref_arg.requires_grad:
-            torch.testing.assert_close(ref_arg.grad, triton_arg.grad, atol=atol, rtol=rtol, msg=name)
+            grad_atol, grad_rtol = tolerances.get(name, (atol, rtol)) if tolerances else (atol, rtol)
+            torch.testing.assert_close(ref_arg.grad, triton_arg.grad, atol=grad_atol, rtol=grad_rtol, msg=name)
 
 
 def test_gelu_mlp_forward_backward():
@@ -80,9 +81,21 @@ def test_gelu_mlp_large_tf32_forward_backward():
 
         ref_out = ref_gelu_mlp(x, w1, b1, w2, b2)
         triton_out = triton_gelu_mlp(*triton_args)
-        torch.testing.assert_close(triton_out, ref_out, atol=1e-2, rtol=7e-3)
+        torch.testing.assert_close(triton_out, ref_out, atol=3e-3, rtol=7e-3)
 
         grad = torch.randn_like(ref_out)
         ref_out.backward(grad)
         triton_out.backward(grad)
-        _assert_grads_close((x, w1, b1, w2, b2), triton_args, ("x", "w1", "b1", "w2", "b2"), atol=2e-1, rtol=7e-3)
+        _assert_grads_close(
+            (x, w1, b1, w2, b2),
+            triton_args,
+            ("x", "w1", "b1", "w2", "b2"),
+            rtol=7e-3,
+            tolerances={
+                "x": (3e-3, 7e-3),
+                "w1": (4e-2, 7e-3),
+                "b1": (2e-2, 7e-3),
+                "w2": (6e-2, 7e-3),
+                "b2": (5e-5, 7e-3),
+            },
+        )
