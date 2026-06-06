@@ -34,8 +34,10 @@ from plu.triton.linear.forward import linear_forward_2d as triton_linear_forward
 from plu.triton.mx_linear import (
     mxfp4_linear,
     mxfp8_linear,
+    nvfp4_linear,
     pack_mxfp4_weight,
     pack_mxfp8_weight,
+    pack_nvfp4_weight,
 )
 from plu.triton.qkv_proj import qkv_proj as triton_qkv_proj
 from plu.triton.residual_add import residual_add as triton_residual_add
@@ -297,17 +299,21 @@ def bench_mx_linear(args: argparse.Namespace) -> list[dict]:
     bias = torch.zeros(args.linear_out, device="cuda", dtype=torch.bfloat16)
     fp8_weight, fp8_scales, fp8_in_features = pack_mxfp8_weight(weight)
     fp4_weight, fp4_scales, fp4_in_features = pack_mxfp4_weight(weight)
+    nvfp4_weight, nvfp4_scales, nvfp4_in_features = pack_nvfp4_weight(weight)
 
     bf16_out = triton_linear_forward_2d(x, weight, bias)
     fp8_out = mxfp8_linear(x, fp8_weight, fp8_scales, fp8_in_features, bias)
     fp4_out = mxfp4_linear(x, fp4_weight, fp4_scales, fp4_in_features, bias)
+    nvfp4_out = nvfp4_linear(x, nvfp4_weight, nvfp4_scales, nvfp4_in_features, bias)
 
     bf16_ms = cuda_time_ms(lambda: triton_linear_forward_2d(x, weight, bias), args.warmup, args.iters)
     fp8_ms = cuda_time_ms(lambda: mxfp8_linear(x, fp8_weight, fp8_scales, fp8_in_features, bias), args.warmup, args.iters)
     fp4_ms = cuda_time_ms(lambda: mxfp4_linear(x, fp4_weight, fp4_scales, fp4_in_features, bias), args.warmup, args.iters)
+    nvfp4_ms = cuda_time_ms(lambda: nvfp4_linear(x, nvfp4_weight, nvfp4_scales, nvfp4_in_features, bias), args.warmup, args.iters)
     bf16_bytes = weight.numel() * weight.element_size()
     fp8_bytes = fp8_weight.numel() * fp8_weight.element_size() + fp8_scales.numel() * fp8_scales.element_size()
     fp4_bytes = fp4_weight.numel() * fp4_weight.element_size() + fp4_scales.numel() * fp4_scales.element_size()
+    nvfp4_bytes = nvfp4_weight.numel() * nvfp4_weight.element_size() + nvfp4_scales.numel() * nvfp4_scales.element_size()
 
     return [
         {
@@ -342,6 +348,17 @@ def bench_mx_linear(args: argparse.Namespace) -> list[dict]:
             "rel_l2_vs_bf16_output": _rel_l2(fp4_out, bf16_out),
             "weight_storage_bytes": fp4_bytes,
             "compression_vs_bf16": bf16_bytes / fp4_bytes,
+        },
+        {
+            "op": "mx_linear",
+            "target": "nvfp4",
+            "format": "nvfp4_e2m1_e4m3_block16",
+            "mode": "forward",
+            "ms": nvfp4_ms,
+            "speedup_vs_bf16": bf16_ms / nvfp4_ms,
+            "rel_l2_vs_bf16_output": _rel_l2(nvfp4_out, bf16_out),
+            "weight_storage_bytes": nvfp4_bytes,
+            "compression_vs_bf16": bf16_bytes / nvfp4_bytes,
         },
     ]
 

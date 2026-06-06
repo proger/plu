@@ -152,11 +152,36 @@ class PackedMxLinear:
                 self.input_grad_scale_codes,
                 self.input_grad_in_features,
             )
+        if self.format == "nvfp4":
+            from plu.triton.mx_linear import nvfp4_linear, nvfp4_linear_with_master_weight
+
+            if master_weight_grads:
+                return nvfp4_linear_with_master_weight(
+                    x,
+                    self.packed_weight,
+                    self.scale_codes,
+                    self.in_features,
+                    self.master_weight,
+                    self.bias,
+                    self.input_grad_packed_weight,
+                    self.input_grad_scale_codes,
+                    self.input_grad_in_features,
+                )
+            return nvfp4_linear(
+                x,
+                self.packed_weight,
+                self.scale_codes,
+                self.in_features,
+                self.bias,
+                self.input_grad_packed_weight,
+                self.input_grad_scale_codes,
+                self.input_grad_in_features,
+            )
         raise RuntimeError(f"unsupported packed MX format: {self.format}")
 
 
 def pack_mx_linear(module: torch.nn.Linear, format: str) -> PackedMxLinear:
-    from plu.triton.mx_linear import pack_mxfp4_weight, pack_mxfp8_weight
+    from plu.triton.mx_linear import pack_mxfp4_weight, pack_mxfp8_weight, pack_nvfp4_weight
 
     weight = module.weight.detach().contiguous()
     bias = module.bias
@@ -166,6 +191,9 @@ def pack_mx_linear(module: torch.nn.Linear, format: str) -> PackedMxLinear:
     elif format == "mxfp4":
         packed_weight, scale_codes, in_features = pack_mxfp4_weight(weight)
         input_grad_packed_weight, input_grad_scale_codes, input_grad_in_features = pack_mxfp4_weight(weight.T.contiguous())
+    elif format == "nvfp4":
+        packed_weight, scale_codes, in_features = pack_nvfp4_weight(weight)
+        input_grad_packed_weight, input_grad_scale_codes, input_grad_in_features = pack_nvfp4_weight(weight.T.contiguous())
     else:
         raise RuntimeError(f"unsupported MX format: {format}")
     bf16_storage_bytes = weight.numel() * weight.element_size()
@@ -459,7 +487,7 @@ def run_child(args: argparse.Namespace) -> dict[str, Any]:
     labels = torch.randint(model.config.vocab_size, (args.batch, args.decoder_len), device=args.device)
     packed_mx: dict[int, PackedMxLinear] | None = None
     mx_stats: dict[str, Any] = {}
-    if args.child_backend in {"mxfp8", "mxfp4"}:
+    if args.child_backend in {"mxfp8", "mxfp4", "nvfp4"}:
         packed_mx, mx_stats = pack_mx_model(model, args.child_backend)
     total_encoder_layers = len(model.model.encoder.layers)
     backward_encoder_layer_start = encoder_backward_start(total_encoder_layers, args.encoder_backward_layers)
@@ -635,7 +663,7 @@ def child_argv(args: argparse.Namespace, backend: str) -> list[str]:
 
 def run_parent(args: argparse.Namespace) -> None:
     if args.backend == "all":
-        backends = ["ref", "triton", "mxfp8", "mxfp4"]
+        backends = ["ref", "triton", "mxfp8", "mxfp4", "nvfp4"]
     else:
         backends = [args.backend]
     rows: list[dict[str, Any]] = []
@@ -696,7 +724,7 @@ def run_parent(args: argparse.Namespace) -> None:
         print(json.dumps(summary), flush=True)
     baseline = by_target.get("triton") or by_target.get("ref")
     if baseline is not None:
-        for target in ("mxfp8", "mxfp4"):
+        for target in ("mxfp8", "mxfp4", "nvfp4"):
             if target not in by_target:
                 continue
             target_ms = by_target[target]["mean_ms"]
@@ -740,8 +768,8 @@ def run_parent(args: argparse.Namespace) -> None:
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Benchmark full PLU Whisper forward+backward passes.")
     parser.add_argument("--model", default="openai/whisper-large-v3-turbo", help="Local model path or Hugging Face repo id.")
-    parser.add_argument("--backend", choices=["all", "ref", "triton", "mxfp8", "mxfp4"], default="all")
-    parser.add_argument("--child-backend", choices=["ref", "triton", "mxfp8", "mxfp4"], default=None, help=argparse.SUPPRESS)
+    parser.add_argument("--backend", choices=["all", "ref", "triton", "mxfp8", "mxfp4", "nvfp4"], default="all")
+    parser.add_argument("--child-backend", choices=["ref", "triton", "mxfp8", "mxfp4", "nvfp4"], default=None, help=argparse.SUPPRESS)
     parser.add_argument("--device", default="cuda")
     parser.add_argument("--dtype", choices=["float32", "fp32", "bfloat16", "bf16"], default="float32")
     parser.add_argument("--batch", type=int, default=1)
