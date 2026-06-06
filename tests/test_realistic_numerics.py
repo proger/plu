@@ -8,11 +8,39 @@ from collections.abc import Callable
 from pathlib import Path
 from typing import Any
 
+import pytest
 import torch
 from torch import Tensor
 
 from plu.realistic_inputs import DEFAULT_WAV
 from plu.train_data import load_audio, log_mel_spectrogram
+
+
+ROOT = Path(__file__).resolve().parents[1]
+DEFAULT_MODEL = (
+    Path(os.environ.get("PLU_MODEL_CACHE", "~/.cache/plu/models")).expanduser()
+    / "openai--whisper-large-v3-turbo"
+)
+
+
+def _required_file(path: Path, reason: str) -> Path:
+    if not path.exists():
+        pytest.skip(reason)
+    return path
+
+
+def _model_path() -> Path:
+    return _required_file(
+        Path(os.environ.get("PLU_REALISTIC_NUMERICS_MODEL", str(DEFAULT_MODEL))).expanduser(),
+        "cached openai/whisper-large-v3-turbo model is required for realistic numerics",
+    )
+
+
+def _wav_path() -> Path:
+    return _required_file(
+        Path(os.environ.get("PLU_REALISTIC_NUMERICS_WAV", DEFAULT_WAV)).expanduser(),
+        "realistic wav fixture is required for realistic numerics",
+    )
 
 
 def _set_tf32(enabled: bool) -> None:
@@ -276,6 +304,37 @@ def validate_realistic_ops(model_name_or_path: str, wav_path: str | Path = DEFAU
         _compare_tensor_op("lora", ref_lora_linear, triton_lora_linear, cases["lora"], grad_mode="sum", atol=1e-1, rtol=7e-3, grad_atol=1.0, grad_rtol=7e-3),
     ]
     return results
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required for Triton realistic numerics")
+def test_whisper_turbo_realistic_op_numerics() -> None:
+    pytest.importorskip("triton")
+    previous_backend = os.environ.get("PLU_OPS_BACKEND")
+    try:
+        results = validate_realistic_ops(str(_model_path()), _wav_path(), "cuda")
+    finally:
+        if previous_backend is None:
+            os.environ.pop("PLU_OPS_BACKEND", None)
+        else:
+            os.environ["PLU_OPS_BACKEND"] = previous_backend
+        sys.modules.pop("plu.whisper", None)
+
+    assert {result["op"] for result in results} == {
+        "conv1d_gelu.conv1",
+        "conv1d_gelu.conv2",
+        "encoder_position_embedding",
+        "decoder_embedding",
+        "layer_norm",
+        "qkv_proj",
+        "flash_attention",
+        "c_proj",
+        "residual_add",
+        "gelu_mlp",
+        "linear",
+        "matmul_top1",
+        "cross_entropy",
+        "lora",
+    }
 
 
 def main() -> None:
