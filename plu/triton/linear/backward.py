@@ -160,6 +160,7 @@ def linear_input_grad(grad_out: Tensor, weight: Tensor) -> Tensor:
     if rows == 0:
         return grad_input
     use_large_tiles = rows >= 512 and out_features >= 512 and in_features >= 256
+    use_tf32 = use_large_tiles and grad_out.dtype == torch.float32 and weight.dtype == torch.float32
     block_m = 64 if use_large_tiles else 16
     block_k = 128 if use_large_tiles else 32
     block_n = 32
@@ -170,7 +171,7 @@ def linear_input_grad(grad_out: Tensor, weight: Tensor) -> Tensor:
         rows,
         out_features,
         in_features,
-        use_large_tiles,
+        use_tf32,
         block_m,
         block_k,
         block_n,
@@ -184,6 +185,7 @@ def linear_weight_bias_grad(grad_out: Tensor, x: Tensor, has_bias: bool, dtype: 
     in_features = x.shape[1]
     grad_dtype = grad_out.dtype if dtype is None else dtype
     use_large_tiles = rows >= 512 and out_features >= 512 and in_features >= 256
+    use_tf32 = use_large_tiles and grad_out.dtype == torch.float32 and x.dtype == torch.float32
     if use_large_tiles:
         grad_weight = torch.empty((out_features, in_features), device=grad_out.device, dtype=grad_dtype)
     else:
@@ -204,7 +206,7 @@ def linear_weight_bias_grad(grad_out: Tensor, x: Tensor, has_bias: bool, dtype: 
             rows,
             out_features,
             in_features,
-            use_large_tiles,
+            use_tf32,
             block_n,
             block_k,
             block_m,
@@ -220,7 +222,7 @@ def linear_weight_bias_grad(grad_out: Tensor, x: Tensor, has_bias: bool, dtype: 
             rows,
             out_features,
             in_features,
-            use_large_tiles,
+            use_tf32,
             block_n,
             block_k,
             block_m,

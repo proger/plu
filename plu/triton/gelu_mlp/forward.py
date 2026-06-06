@@ -3,6 +3,7 @@ from __future__ import annotations
 import torch
 import triton
 import triton.language as tl
+from triton.language.extra.cuda import libdevice
 from torch import Tensor
 
 from plu.triton.gelu_mlp.backward import linear_input_gelu_grad
@@ -50,8 +51,8 @@ def _linear_gelu_forward_kernel(
     if has_bias:
         bias = tl.load(bias_ptr + offs_n, mask=offs_n < out_features, other=0.0).to(tl.float32)
         acc += bias[None, :]
-    inv_sqrt2 = 0.7071067811865476
-    hidden = 0.5 * acc * (1.0 + tl.erf(acc * inv_sqrt2))
+    inv_sqrt2 = 0.7071067690849304
+    hidden = acc * 0.5 * (1.0 + libdevice.erf(acc * inv_sqrt2))
     mask = (offs_m[:, None] < rows) & (offs_n[None, :] < out_features)
     offsets = offs_m[:, None] * out_features + offs_n[None, :]
     tl.store(preact_ptr + offsets, acc, mask=mask)
@@ -122,6 +123,7 @@ def _gelu_mlp_forward(
         return out, preact, hidden
 
     use_large_tiles = rows >= 512 and in_features >= 512 and hidden_features >= 2048
+    use_tf32 = use_large_tiles and x_2d.dtype == torch.float32
     block_m = 64 if use_large_tiles else 16
     block_n = 128 if use_large_tiles else 32
     block_k = 32 if use_large_tiles else 32
@@ -136,7 +138,7 @@ def _gelu_mlp_forward(
         in_features,
         hidden_features,
         fc1_bias is not None,
-        use_large_tiles,
+        use_tf32,
         block_m,
         block_n,
         block_k,
@@ -151,7 +153,7 @@ def _gelu_mlp_forward(
         hidden_features,
         out_features,
         fc2_bias is not None,
-        use_large_tiles,
+        use_tf32,
         block_m,
         block_n,
         block_k,

@@ -3,6 +3,7 @@ from __future__ import annotations
 import torch
 import triton
 import triton.language as tl
+from triton.language.extra.cuda import libdevice
 from torch import Tensor
 
 
@@ -21,7 +22,7 @@ def _gelu_backward_kernel(
     grad = tl.load(grad_hidden_ptr + offsets, mask=mask, other=0.0).to(tl.float32)
     inv_sqrt2 = 0.7071067811865476
     inv_sqrt2pi = 0.3989422804014327
-    cdf = 0.5 * (1.0 + tl.erf(x * inv_sqrt2))
+    cdf = 0.5 * (1.0 + libdevice.erf(x * inv_sqrt2))
     pdf_term = x * inv_sqrt2pi * tl.exp(-0.5 * x * x)
     tl.store(grad_preact_ptr + offsets, grad * (cdf + pdf_term), mask=mask)
 
@@ -70,7 +71,7 @@ def _linear_input_gelu_grad_kernel(
     ).to(tl.float32)
     inv_sqrt2 = 0.7071067811865476
     inv_sqrt2pi = 0.3989422804014327
-    cdf = 0.5 * (1.0 + tl.erf(preact * inv_sqrt2))
+    cdf = 0.5 * (1.0 + libdevice.erf(preact * inv_sqrt2))
     pdf_term = preact * inv_sqrt2pi * tl.exp(-0.5 * preact * preact)
     tl.store(
         grad_input_ptr + offs_m[:, None] * in_features + offs_k[None, :],
@@ -102,6 +103,7 @@ def linear_input_gelu_grad(grad_out: Tensor, weight: Tensor, preact: Tensor) -> 
     if rows == 0:
         return grad_input
     use_large_tiles = rows >= 512 and out_features >= 512 and in_features >= 256
+    use_tf32 = use_large_tiles and grad_out.dtype == torch.float32 and weight.dtype == torch.float32
     block_m = 64 if use_large_tiles else 16
     block_k = 128 if use_large_tiles else 32
     block_n = 32
@@ -113,7 +115,7 @@ def linear_input_gelu_grad(grad_out: Tensor, weight: Tensor, preact: Tensor) -> 
         rows,
         out_features,
         in_features,
-        use_large_tiles,
+        use_tf32,
         block_m,
         block_k,
         block_n,

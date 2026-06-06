@@ -3,6 +3,7 @@ from __future__ import annotations
 import torch
 import triton
 import triton.language as tl
+from triton.language.extra.cuda import libdevice
 from torch import Tensor
 
 from plu.triton.conv1d_gelu.backward import conv1d_gelu_backward
@@ -49,7 +50,7 @@ def _gelu_kernel(
     mask = offsets < total
     x = tl.load(preact_ptr + offsets, mask=mask, other=0.0).to(tl.float32)
     inv_sqrt2 = 0.7071067811865476
-    out = 0.5 * x * (1.0 + tl.erf(x * inv_sqrt2))
+    out = 0.5 * x * (1.0 + libdevice.erf(x * inv_sqrt2))
     tl.store(out_ptr + offsets, out, mask=mask)
 
 
