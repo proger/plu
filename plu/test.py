@@ -3,11 +3,13 @@ from __future__ import annotations
 import argparse
 import json
 import os
+from collections.abc import Sequence
 from logging import getLogger
 from pathlib import Path
 
 import torch
 
+from plu.triton.sampling import make_suppress_mask, sample_next_token, update_decode_control_
 from plu.tokenizer import LANGUAGES, TO_LANGUAGE_CODE, WhisperTokenizer
 from plu.train_data import SAMPLE_RATE, load_audio, log_mel_spectrogram
 from plu.whisper import WhisperForConditionalGeneration, resolve_model_path
@@ -184,13 +186,25 @@ def configure_tokenizer(model_path: Path, model: WhisperForConditionalGeneration
     )
 
 
-def prompt_ids(tokenizer: WhisperTokenizer, language: str | None, *, without_timestamps: bool = True) -> list[int]:
+def prompt_ids(
+    tokenizer: WhisperTokenizer,
+    language: str | None,
+    *,
+    without_timestamps: bool = True,
+    previous_tokens: Sequence[int] | None = None,
+    max_previous_tokens: int | None = None,
+) -> list[int]:
     prompt = [tokenizer.sot]
     if language:
         prompt.append(tokenizer.to_language_token(language))
     prompt.append(tokenizer.transcribe)
     if without_timestamps:
         prompt.append(tokenizer.no_timestamps)
+    if previous_tokens:
+        context = [int(token) for token in previous_tokens]
+        if max_previous_tokens is not None:
+            context = context[-max_previous_tokens:]
+        prompt = [tokenizer.sot_prev, *context, *prompt]
     return prompt
 
 
@@ -438,8 +452,6 @@ class Mxfp8KvCacheCudaGraphSampler:
     ):
         if decode_batch_size < 1:
             raise ValueError("--decode_batch_size must be at least 1")
-        if timestamps_after_sentence_end and decode_batch_size != 1:
-            raise ValueError("sentence-end timestamp forcing is only supported with --decode_batch_size 1")
         self.model = model
         self.tokenizer = tokenizer
         self.packed = packed
@@ -459,21 +471,48 @@ class Mxfp8KvCacheCudaGraphSampler:
             device=self.device,
             dtype=torch.long,
         )
+        self.suppress_mask = make_suppress_mask(model.config.vocab_size, self.suppress_tokens, device=self.device)
+        sentence_end_token_mask = torch.zeros(model.config.vocab_size, dtype=torch.bool)
+        for token in range(min(self.timestamp_begin, model.config.vocab_size)):
+            if token != self.eos_token_id and tokenizer.decode([token]).rstrip().endswith((".", "!", "?")):
+                sentence_end_token_mask[token] = True
+        self.sentence_end_token_mask = sentence_end_token_mask.to(device=self.device)
         self.static_current_token = torch.full((self.decode_batch_size,), self.eos_token_id, device=self.device, dtype=torch.long)
         self.static_position = torch.zeros(self.decode_batch_size, device=self.device, dtype=torch.long)
         self.static_force_timestamp = torch.zeros(self.decode_batch_size, device=self.device, dtype=torch.bool)
+        self.static_pair_timestamp = torch.zeros(self.decode_batch_size, device=self.device, dtype=torch.bool)
+        self.static_pair_timestamp_token = torch.full(
+            (self.decode_batch_size,),
+            self.timestamp_begin,
+            device=self.device,
+            dtype=torch.long,
+        )
+        self.greedy_batch_mask = torch.zeros(self.decode_batch_size, device=self.device, dtype=torch.bool)
+        self.greedy_batch_mask[0] = True
         self.static_min_timestamp = torch.full(
             (self.decode_batch_size,),
             self.timestamp_begin,
             device=self.device,
             dtype=torch.long,
         )
-        self.timestamp_token_ids = torch.arange(
-            self.timestamp_begin,
-            model.config.vocab_size,
+        self.static_sampling_seed = torch.zeros((), device=self.device, dtype=torch.int64)
+        self._sampling_seed_counter = 0
+        self.last_page_resample_count = 0
+        self.generated_token_buffer = torch.full(
+            (self.decode_batch_size, self.max_target_positions),
+            self.eos_token_id,
             device=self.device,
             dtype=torch.long,
         )
+        self.generated_logprob_buffer = torch.zeros(
+            (self.decode_batch_size, self.max_target_positions),
+            device=self.device,
+            dtype=torch.float32,
+        )
+        self.generated_lengths = torch.zeros(self.decode_batch_size, device=self.device, dtype=torch.long)
+        self.finished = torch.zeros(self.decode_batch_size, device=self.device, dtype=torch.bool)
+        self.no_speech_probs = torch.zeros(self.decode_batch_size, device=self.device, dtype=torch.float32)
+        self.all_finished = torch.zeros((), device=self.device, dtype=torch.bool)
 
         decoder = model.model.decoder
         self.self_key_caches = []
@@ -585,33 +624,18 @@ class Mxfp8KvCacheCudaGraphSampler:
         logits = _packed_linear(self.packed, self.model.proj_out, decoder_hidden_states, master_weight_grads=False).float().squeeze(1)
         raw_logprobs = logits.log_softmax(dim=-1)
         no_speech_prob = raw_logprobs[:, self.no_speech_token].exp()
-        if self.suppress_tokens.numel():
-            logits.index_fill_(1, self.suppress_tokens, -float("inf"))
-        if self.timestamps_after_sentence_end:
-            timestamp_logits = logits[:, self.timestamp_begin :]
-            valid_timestamps = self.timestamp_token_ids[None, :] >= self.static_min_timestamp[:, None]
-            timestamp_logits = timestamp_logits.masked_fill(~valid_timestamps, -float("inf"))
-            force_timestamp = self.static_force_timestamp[:, None]
-            logits[:, : self.timestamp_begin] = torch.where(
-                force_timestamp,
-                torch.full_like(logits[:, : self.timestamp_begin], -float("inf")),
-                logits[:, : self.timestamp_begin],
-            )
-            logits[:, self.timestamp_begin :] = torch.where(
-                force_timestamp,
-                timestamp_logits,
-                torch.full_like(timestamp_logits, -float("inf")),
-            )
-        else:
-            logits[:, self.timestamp_begin :].fill_(-float("inf"))
-        logprobs = logits.log_softmax(dim=-1)
-        if self.decode_batch_size == 1:
-            next_token = logits.argmax(dim=-1)
-        else:
-            uniform = torch.rand_like(logits)
-            gumbel = -torch.log(-torch.log(uniform.clamp_(min=1e-6, max=1.0 - 1e-6)))
-            next_token = (logits + gumbel).argmax(dim=-1)
-        selected_logprob = logprobs.gather(1, next_token[:, None]).squeeze(1)
+        next_token, selected_logprob = sample_next_token(
+            logits,
+            timestamp_begin=self.timestamp_begin,
+            suppress_mask=self.suppress_mask,
+            timestamps_after_sentence_end=self.timestamps_after_sentence_end,
+            min_timestamp_tokens=self.static_min_timestamp,
+            force_timestamp=self.static_force_timestamp,
+            pair_timestamp=self.static_pair_timestamp,
+            pair_timestamp_tokens=self.static_pair_timestamp_token,
+            greedy_batch_mask=None if self.decode_batch_size == 1 else self.greedy_batch_mask,
+            seed=self.static_sampling_seed,
+        )
         return next_token, selected_logprob, no_speech_prob
 
     def _capture(self) -> None:
@@ -638,16 +662,16 @@ class Mxfp8KvCacheCudaGraphSampler:
         self.graph = graph
         self.capture_ms = capture_start.elapsed_time(capture_end)
 
-    def _replay(
+    def _set_replay_inputs(
         self,
         tokens: int | list[int] | torch.Tensor,
         position: int,
         *,
         force_timestamps: bool | list[bool] | torch.Tensor = False,
+        pair_timestamps: bool | list[bool] | torch.Tensor = False,
+        pair_timestamp_tokens: int | list[int] | torch.Tensor | None = None,
         min_timestamp_tokens: int | list[int] | torch.Tensor | None = None,
-    ) -> tuple[list[int], list[float], list[float]]:
-        if self.graph is None or self.graph_next_token is None or self.graph_selected_logprob is None or self.graph_no_speech_prob is None:
-            raise RuntimeError("CUDA graph sampler has not been captured")
+    ) -> None:
         if isinstance(tokens, int):
             self.static_current_token.fill_(tokens)
         elif isinstance(tokens, torch.Tensor):
@@ -665,6 +689,24 @@ class Mxfp8KvCacheCudaGraphSampler:
             if len(force_timestamps) != self.decode_batch_size:
                 raise ValueError(f"expected {self.decode_batch_size} timestamp-force flags, got {len(force_timestamps)}")
             self.static_force_timestamp.copy_(torch.tensor(force_timestamps, device=self.device, dtype=torch.bool))
+        if isinstance(pair_timestamps, bool):
+            self.static_pair_timestamp.fill_(pair_timestamps)
+        elif isinstance(pair_timestamps, torch.Tensor):
+            self.static_pair_timestamp.copy_(pair_timestamps.to(device=self.device, dtype=torch.bool))
+        else:
+            if len(pair_timestamps) != self.decode_batch_size:
+                raise ValueError(f"expected {self.decode_batch_size} timestamp-pair flags, got {len(pair_timestamps)}")
+            self.static_pair_timestamp.copy_(torch.tensor(pair_timestamps, device=self.device, dtype=torch.bool))
+        if pair_timestamp_tokens is None:
+            self.static_pair_timestamp_token.fill_(self.timestamp_begin)
+        elif isinstance(pair_timestamp_tokens, int):
+            self.static_pair_timestamp_token.fill_(pair_timestamp_tokens)
+        elif isinstance(pair_timestamp_tokens, torch.Tensor):
+            self.static_pair_timestamp_token.copy_(pair_timestamp_tokens.to(device=self.device, dtype=torch.long))
+        else:
+            if len(pair_timestamp_tokens) != self.decode_batch_size:
+                raise ValueError(f"expected {self.decode_batch_size} timestamp-pair tokens, got {len(pair_timestamp_tokens)}")
+            self.static_pair_timestamp_token.copy_(torch.tensor(pair_timestamp_tokens, device=self.device, dtype=torch.long))
         if min_timestamp_tokens is None:
             self.static_min_timestamp.fill_(self.timestamp_begin)
         elif isinstance(min_timestamp_tokens, int):
@@ -675,83 +717,155 @@ class Mxfp8KvCacheCudaGraphSampler:
             if len(min_timestamp_tokens) != self.decode_batch_size:
                 raise ValueError(f"expected {self.decode_batch_size} minimum timestamp tokens, got {len(min_timestamp_tokens)}")
             self.static_min_timestamp.copy_(torch.tensor(min_timestamp_tokens, device=self.device, dtype=torch.long))
+
+    def _replay_device(
+        self,
+        tokens: int | list[int] | torch.Tensor,
+        position: int,
+        *,
+        force_timestamps: bool | list[bool] | torch.Tensor = False,
+        pair_timestamps: bool | list[bool] | torch.Tensor = False,
+        pair_timestamp_tokens: int | list[int] | torch.Tensor | None = None,
+        min_timestamp_tokens: int | list[int] | torch.Tensor | None = None,
+    ) -> None:
+        if self.graph is None or self.graph_next_token is None or self.graph_selected_logprob is None or self.graph_no_speech_prob is None:
+            raise RuntimeError("CUDA graph sampler has not been captured")
+        self._set_replay_inputs(
+            tokens,
+            position,
+            force_timestamps=force_timestamps,
+            pair_timestamps=pair_timestamps,
+            pair_timestamp_tokens=pair_timestamp_tokens,
+            min_timestamp_tokens=min_timestamp_tokens,
+        )
+        self._sampling_seed_counter = (self._sampling_seed_counter + 1) & 0x7FFFFFFF
+        self.static_sampling_seed.fill_(self._sampling_seed_counter)
         self.graph.replay()
+
+    def _replay(
+        self,
+        tokens: int | list[int] | torch.Tensor,
+        position: int,
+        *,
+        force_timestamps: bool | list[bool] | torch.Tensor = False,
+        pair_timestamps: bool | list[bool] | torch.Tensor = False,
+        pair_timestamp_tokens: int | list[int] | torch.Tensor | None = None,
+        min_timestamp_tokens: int | list[int] | torch.Tensor | None = None,
+    ) -> tuple[list[int], list[float], list[float]]:
+        if self.graph_next_token is None or self.graph_selected_logprob is None or self.graph_no_speech_prob is None:
+            raise RuntimeError("CUDA graph sampler has not been captured")
+        self._replay_device(
+            tokens,
+            position,
+            force_timestamps=force_timestamps,
+            pair_timestamps=pair_timestamps,
+            pair_timestamp_tokens=pair_timestamp_tokens,
+            min_timestamp_tokens=min_timestamp_tokens,
+        )
         next_tokens = self.graph_next_token.detach().cpu().tolist()
         selected_logprobs = self.graph_selected_logprob.detach().cpu().tolist()
         no_speech_probs = self.graph_no_speech_prob.detach().cpu().tolist()
         return next_tokens, selected_logprobs, no_speech_probs
 
-    def _is_sentence_end_token(self, token: int) -> bool:
-        if token >= self.timestamp_begin or token == self.eos_token_id:
-            return False
-        return self.tokenizer.decode([token]).rstrip().endswith((".", "!", "?"))
-
-    def sample_many(self, encoder_hidden_states: torch.Tensor, max_new_tokens: int) -> list[tuple[list[int], list[float], float]]:
+    def sample_many(
+        self,
+        encoder_hidden_states: torch.Tensor,
+        max_new_tokens: int,
+        prompt: list[int] | None = None,
+        stop_after_first_sentence: bool = False,
+    ) -> list[tuple[list[int], list[float], float]]:
+        if self.graph is None or self.graph_next_token is None or self.graph_selected_logprob is None or self.graph_no_speech_prob is None:
+            raise RuntimeError("CUDA graph sampler has not been captured")
         self.prepare_encoder(encoder_hidden_states)
+        self.last_page_resample_count = 0
         for key_cache, value_cache in zip(self.self_key_caches, self.self_value_caches):
             key_cache.zero_()
             value_cache.zero_()
 
-        selected_logprobs: list[list[float]] = [[] for _ in range(self.decode_batch_size)]
-        generated: list[list[int]] = [[] for _ in range(self.decode_batch_size)]
-        finished = [False] * self.decode_batch_size
-        no_speech_probs = [0.0] * self.decode_batch_size
+        prompt = self.prompt if prompt is None else prompt
+        prompt_len = min(len(prompt), self.max_target_positions)
+        self.generated_token_buffer.fill_(self.eos_token_id)
+        self.generated_logprob_buffer.zero_()
+        self.generated_lengths.zero_()
+        self.finished.zero_()
+        self.no_speech_probs.zero_()
+        self.all_finished.fill_(False)
+        self.static_current_token.fill_(self.eos_token_id)
+        self.static_position.zero_()
+        self.static_force_timestamp.zero_()
+        self.static_pair_timestamp.zero_()
+        self.static_pair_timestamp_token.fill_(self.timestamp_begin)
+        self.static_min_timestamp.fill_(self.timestamp_begin)
 
-        next_tokens = [self.eos_token_id] * self.decode_batch_size
-        next_logprobs = [0.0] * self.decode_batch_size
-        force_timestamp_next = [False] * self.decode_batch_size
-        min_timestamp_tokens = [self.timestamp_begin] * self.decode_batch_size
-        prompt_len = min(len(self.prompt), self.max_target_positions)
-        for position, token in enumerate(self.prompt[:prompt_len]):
+        for position, token in enumerate(prompt[:prompt_len]):
             force_initial_timestamp = self.timestamps_after_sentence_end and position == prompt_len - 1
-            next_tokens, next_logprobs, step_no_speech_probs = self._replay(
+            self._replay_device(
                 token,
                 position,
                 force_timestamps=force_initial_timestamp,
-                min_timestamp_tokens=min_timestamp_tokens,
+                pair_timestamps=False,
+                pair_timestamp_tokens=self.timestamp_begin,
+                min_timestamp_tokens=self.timestamp_begin,
             )
             if position == prompt_len - 1:
-                no_speech_probs = step_no_speech_probs
+                self.no_speech_probs.copy_(self.graph_no_speech_prob)
 
-        while max((len(tokens) for tokens in generated), default=0) < max_new_tokens:
-            for index, (next_token, next_logprob) in enumerate(zip(next_tokens, next_logprobs)):
-                if finished[index]:
-                    continue
-                generated[index].append(next_token)
-                selected_logprobs[index].append(next_logprob)
-                if next_token == self.eos_token_id:
-                    finished[index] = True
-                if next_token >= self.timestamp_begin:
-                    min_timestamp_tokens[index] = max(min_timestamp_tokens[index], next_token + 1)
-                    force_timestamp_next[index] = False
-                elif self.timestamps_after_sentence_end and self._is_sentence_end_token(next_token):
-                    force_timestamp_next[index] = True
-                else:
-                    force_timestamp_next[index] = False
-            if all(finished):
-                break
-            if max(len(tokens) for tokens in generated) >= max_new_tokens:
-                break
-            position = prompt_len + max(len(tokens) for tokens in generated) - 1
-            if position >= self.max_target_positions:
-                break
-            replay_tokens = [tokens[-1] if tokens and not done else self.eos_token_id for tokens, done in zip(generated, finished)]
-            replay_force_timestamps = [force and not done for force, done in zip(force_timestamp_next, finished)]
-            next_tokens, next_logprobs, _ = self._replay(
-                replay_tokens,
-                position,
-                force_timestamps=replay_force_timestamps,
-                min_timestamp_tokens=min_timestamp_tokens,
-            )
+        max_steps = min(max_new_tokens, self.generated_token_buffer.shape[1])
+        if prompt_len > 0 and max_steps > 0:
+            finish_check_interval = 8
+            self.static_position.fill_(prompt_len - 1)
+            for step in range(max_steps):
+                update_decode_control_(
+                    self.graph_next_token,
+                    self.graph_selected_logprob,
+                    self.generated_token_buffer,
+                    self.generated_logprob_buffer,
+                    self.generated_lengths,
+                    self.finished,
+                    self.static_current_token,
+                    self.static_force_timestamp,
+                    self.static_pair_timestamp,
+                    self.static_pair_timestamp_token,
+                    self.static_min_timestamp,
+                    self.static_position,
+                    self.static_sampling_seed,
+                    self.all_finished,
+                    self.sentence_end_token_mask,
+                    eos_token_id=self.eos_token_id,
+                    timestamp_begin=self.timestamp_begin,
+                    timestamps_after_sentence_end=self.timestamps_after_sentence_end,
+                    stop_after_first_sentence=stop_after_first_sentence,
+                )
+                must_stop_for_length = step + 1 >= max_steps or prompt_len + step >= self.max_target_positions
+                check_finished = must_stop_for_length or (step + 1) % finish_check_interval == 0
+                if check_finished and bool(self.all_finished.detach().cpu().item()):
+                    break
+                if must_stop_for_length:
+                    break
+                self.graph.replay()
 
-        prompt = self.prompt[:prompt_len]
+        prompt = prompt[:prompt_len]
+        lengths = self.generated_lengths.detach().cpu().tolist()
+        generated_tokens = self.generated_token_buffer.detach().cpu()
+        generated_logprobs = self.generated_logprob_buffer.detach().cpu()
+        no_speech_probs = self.no_speech_probs.detach().cpu().tolist()
+        self._sampling_seed_counter = int(self.static_sampling_seed.detach().cpu().item())
         return [
-            (prompt + generated_tokens, logprobs, no_speech_prob)
-            for generated_tokens, logprobs, no_speech_prob in zip(generated, selected_logprobs, no_speech_probs)
+            (
+                prompt + generated_tokens[index, :length].tolist(),
+                generated_logprobs[index, :length].tolist(),
+                no_speech_probs[index],
+            )
+            for index, length in enumerate(lengths)
         ]
 
-    def sample(self, encoder_hidden_states: torch.Tensor, max_new_tokens: int) -> tuple[list[int], list[float], float]:
-        return self.sample_many(encoder_hidden_states, max_new_tokens)[0]
+    def sample(
+        self,
+        encoder_hidden_states: torch.Tensor,
+        max_new_tokens: int,
+        prompt: list[int] | None = None,
+    ) -> tuple[list[int], list[float], float]:
+        return self.sample_many(encoder_hidden_states, max_new_tokens, prompt=prompt)[0]
 
 
 @torch.no_grad()
