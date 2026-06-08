@@ -10,10 +10,6 @@ from plu.ref.cross_entropy import cross_entropy as ref_cross_entropy
 from plu.ref.flash_attention import flash_attention as ref_flash_attention
 from plu.ref.gelu_mlp import gelu_mlp as ref_gelu_mlp
 from plu.ref.matmul_top1 import matmul_top1 as ref_matmul_top1
-from plu.ref.paged_kv_cache import make_static_page_table as ref_make_static_page_table
-from plu.ref.paged_kv_cache import paged_self_kv_cache_attention as ref_paged_self_kv_cache_attention
-from plu.ref.paged_kv_cache import resample_page_table as ref_resample_page_table
-from plu.ref.paged_kv_cache import resample_state as ref_resample_state
 from plu.ref.c_proj import c_proj as ref_c_proj
 from plu.ref.conv1d_gelu import conv1d_gelu as ref_conv1d_gelu
 from plu.ref.embedding import decoder_embedding as ref_decoder_embedding
@@ -41,10 +37,6 @@ from plu.triton.mx_linear import (
     pack_mxfp8_weight,
     pack_nvfp4_weight,
 )
-from plu.triton.paged_kv_cache import make_static_page_table as triton_make_static_page_table
-from plu.triton.paged_kv_cache import paged_self_kv_cache_attention as triton_paged_self_kv_cache_attention
-from plu.triton.paged_kv_cache import resample_page_table as triton_resample_page_table
-from plu.triton.paged_kv_cache import resample_state as triton_resample_state
 from plu.triton.qkv_proj import qkv_proj as triton_qkv_proj
 from plu.triton.residual_add import residual_add as triton_residual_add
 from plu.triton.unembedding_cross_entropy import unembedding_cross_entropy as triton_unembedding_cross_entropy
@@ -109,58 +101,6 @@ def bench_flash_attention(args: argparse.Namespace) -> list[dict]:
     return [
         {"op": "flash_attention", "target": "ref", "mode": "forward_backward", "ms": cuda_time_ms(ref_step, args.warmup, args.iters)},
         {"op": "flash_attention", "target": "triton", "mode": "forward_backward", "ms": cuda_time_ms(triton_step, args.warmup, args.iters)},
-    ]
-
-
-def bench_paged_kv_cache(args: argparse.Namespace) -> list[dict]:
-    dtype = torch.bfloat16
-    page_size = args.page_size
-    max_pages = (args.target_len + page_size - 1) // page_size
-    pages = args.batch * max_pages
-    query = torch.randn(args.batch, args.heads, 1, args.head_dim, device="cuda", dtype=dtype)
-    key = torch.randn_like(query)
-    value = torch.randn_like(query)
-    position = torch.full((args.batch,), args.target_len - 1, device="cuda", dtype=torch.long)
-    ref_page_table = ref_make_static_page_table(args.batch, max_pages, device="cuda")
-    triton_page_table = triton_make_static_page_table(args.batch, max_pages, device="cuda")
-    ref_key_pages = torch.randn(pages, args.heads, page_size, args.head_dim, device="cuda", dtype=dtype)
-    ref_value_pages = torch.randn_like(ref_key_pages)
-    triton_key_pages = ref_key_pages.clone()
-    triton_value_pages = ref_value_pages.clone()
-    ancestors = torch.arange(args.batch, device="cuda", dtype=torch.long).flip(0)
-    next_page_ids = torch.arange(args.batch, device="cuda", dtype=torch.long) + pages
-    page_table_arena = torch.cat(
-        [triton_page_table, torch.empty(args.batch, 1, device="cuda", dtype=triton_page_table.dtype)],
-        dim=1,
-    )
-    ref_page_table_arena = page_table_arena.clone()
-    state = torch.randn(args.batch, max_pages, args.head_dim, device="cuda", dtype=dtype)
-
-    def ref_attention():
-        ref_paged_self_kv_cache_attention(query, key, value, ref_key_pages, ref_value_pages, ref_page_table, position)
-
-    def triton_attention():
-        triton_paged_self_kv_cache_attention(query, key, value, triton_key_pages, triton_value_pages, triton_page_table, position)
-
-    def ref_page_table_resample():
-        ref_resample_page_table(ref_page_table_arena, ancestors, next_page_ids=next_page_ids, next_page_index=max_pages)
-
-    def triton_page_table_resample():
-        triton_resample_page_table(page_table_arena, ancestors, next_page_ids=next_page_ids, next_page_index=max_pages)
-
-    def ref_state_resample():
-        ref_resample_state(state, ancestors)
-
-    def triton_state_resample():
-        triton_resample_state(state, ancestors)
-
-    return [
-        {"op": "paged_kv_cache_attention", "target": "ref", "mode": "forward", "ms": cuda_time_ms(ref_attention, args.warmup, args.iters)},
-        {"op": "paged_kv_cache_attention", "target": "triton", "mode": "forward", "ms": cuda_time_ms(triton_attention, args.warmup, args.iters)},
-        {"op": "paged_kv_cache_page_table_resample", "target": "ref", "mode": "forward", "ms": cuda_time_ms(ref_page_table_resample, args.warmup, args.iters)},
-        {"op": "paged_kv_cache_page_table_resample", "target": "triton", "mode": "forward", "ms": cuda_time_ms(triton_page_table_resample, args.warmup, args.iters)},
-        {"op": "paged_kv_cache_state_resample", "target": "ref", "mode": "forward", "ms": cuda_time_ms(ref_state_resample, args.warmup, args.iters)},
-        {"op": "paged_kv_cache_state_resample", "target": "triton", "mode": "forward", "ms": cuda_time_ms(triton_state_resample, args.warmup, args.iters)},
     ]
 
 
@@ -539,7 +479,6 @@ def parse_args() -> argparse.Namespace:
         choices=[
             "all",
             "flash_attention",
-            "paged_kv_cache",
             "cross_entropy",
             "unembedding_cross_entropy",
             "matmul_top1",
@@ -569,9 +508,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--vocab", type=int, default=51865)
     parser.add_argument("--mel-bins", type=int, default=128)
     parser.add_argument("--input-frames", type=int, default=None, help="Input frame count for convolution benchmarks. Defaults to query_len * 2.")
-    parser.add_argument("--target-len", type=int, default=448)
     parser.add_argument("--max-target-positions", type=int, default=448)
-    parser.add_argument("--page-size", type=int, default=16)
     parser.add_argument("--linear-out", type=int, default=1280)
     parser.add_argument("--layer-norm-eps", type=float, default=1e-5)
     parser.add_argument("--tf32", action="store_true", help="Enable TF32 for PyTorch reference matmuls to match large Triton tensor-core paths.")
@@ -589,7 +526,6 @@ def main() -> None:
     torch.manual_seed(0)
     benches = {
         "flash_attention": bench_flash_attention,
-        "paged_kv_cache": bench_paged_kv_cache,
         "cross_entropy": bench_cross_entropy,
         "unembedding_cross_entropy": bench_unembedding_cross_entropy,
         "matmul_top1": bench_matmul_top1,
