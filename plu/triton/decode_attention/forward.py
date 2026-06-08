@@ -75,18 +75,23 @@ def _cross_kv_cache_attention_kernel(
     query_ptr,
     key_cache_ptr,
     value_cache_ptr,
+    cache_index_ptr,
     out_ptr,
     key_len: tl.constexpr,
     head_dim: tl.constexpr,
     scale: tl.constexpr,
     block_n: tl.constexpr,
     block_d: tl.constexpr,
+    use_cache_index: tl.constexpr,
 ):
     batch = tl.program_id(0)
     head = tl.program_id(1)
     offs_d = tl.arange(0, block_d)
+    cache_batch = batch
+    if use_cache_index:
+        cache_batch = tl.load(cache_index_ptr + batch)
     query_base = (batch * tl.num_programs(1) + head) * head_dim
-    cache_base = (batch * tl.num_programs(1) + head) * key_len * head_dim
+    cache_base = (cache_batch * tl.num_programs(1) + head) * key_len * head_dim
     dim_mask = offs_d < head_dim
 
     query = tl.load(query_ptr + query_base + offs_d, mask=dim_mask, other=0.0).to(tl.float32)
@@ -165,10 +170,22 @@ def self_kv_cache_attention(query: Tensor, key: Tensor, value: Tensor, key_cache
     return out
 
 
-def cross_kv_cache_attention(query: Tensor, key_cache: Tensor, value_cache: Tensor) -> Tensor:
+def cross_kv_cache_attention(query: Tensor, key_cache: Tensor, value_cache: Tensor, cache_index: Tensor | None = None) -> Tensor:
     batch, heads, head_dim, block_d = _validate_query(query)
-    if key_cache.shape != value_cache.shape or key_cache.shape[:2] != (batch, heads) or key_cache.shape[3] != head_dim:
+    if key_cache.shape != value_cache.shape or key_cache.ndim != 4 or key_cache.shape[1] != heads or key_cache.shape[3] != head_dim:
         raise ValueError("key/value caches must have shape [batch, heads, key_len, head_dim]")
+    if cache_index is None:
+        if key_cache.shape[0] != batch:
+            raise ValueError("key/value cache batch must match query batch unless cache_index is provided")
+        cache_index = query.new_empty((1,), dtype=torch.long)
+        use_cache_index = False
+    else:
+        if not cache_index.is_cuda or cache_index.device != query.device:
+            raise RuntimeError("cache_index must be a CUDA tensor on the query device")
+        if cache_index.numel() != batch:
+            raise ValueError(f"cache_index must have one element per query row, got {cache_index.numel()} for batch {batch}")
+        cache_index = cache_index.contiguous()
+        use_cache_index = True
 
     out = torch.empty_like(query)
     block_n = 64
@@ -176,12 +193,14 @@ def cross_kv_cache_attention(query: Tensor, key_cache: Tensor, value_cache: Tens
         query,
         key_cache,
         value_cache,
+        cache_index,
         out,
         key_cache.shape[2],
         head_dim,
         head_dim**-0.5,
         block_n,
         block_d,
+        use_cache_index,
         num_warps=4,
     )
     return out
