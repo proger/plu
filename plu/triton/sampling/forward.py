@@ -63,6 +63,7 @@ def _sampling_stage1_kernel(
     min_timestamp_tokens_ptr,
     force_timestamp_ptr,
     pair_timestamp_ptr,
+    greedy_batch_mask_ptr,
     seed_ptr,
     partial_logit_max_ptr,
     partial_greedy_value_ptr,
@@ -76,6 +77,7 @@ def _sampling_stage1_kernel(
     has_min_timestamp: tl.constexpr,
     has_force_timestamp: tl.constexpr,
     has_pair_timestamp: tl.constexpr,
+    has_greedy_batch_mask: tl.constexpr,
     timestamps_after_sentence_end: tl.constexpr,
     temperature: tl.constexpr,
     block_size: tl.constexpr,
@@ -106,15 +108,30 @@ def _sampling_stage1_kernel(
     greedy_indices = tl.where(constrained == logit_max, offsets, vocab_size)
     greedy_index = tl.min(greedy_indices, axis=0)
 
-    seed = tl.load(seed_ptr).to(tl.uint32)
-    rng_offsets = row * vocab_size + offsets
-    uniform = tl.rand(seed, rng_offsets)
-    uniform = tl.minimum(tl.maximum(uniform, 1.0e-6), 1.0 - 1.0e-6)
-    gumbel = -tl.log(-tl.log(uniform))
-    sample_scores = constrained / temperature + gumbel
-    sample_max = tl.max(sample_scores, axis=0)
-    sample_indices = tl.where(sample_scores == sample_max, offsets, vocab_size)
-    sample_index = tl.min(sample_indices, axis=0)
+    sample_needed = False
+    if has_greedy_batch_mask:
+        sample_needed = ~tl.load(greedy_batch_mask_ptr + row).to(tl.int1)
+    if has_force_timestamp:
+        sample_needed = sample_needed & ~tl.load(force_timestamp_ptr + row).to(tl.int1)
+    if has_pair_timestamp:
+        pair_timestamp = tl.load(pair_timestamp_ptr + row).to(tl.int1)
+        if has_force_timestamp:
+            pair_timestamp = pair_timestamp & ~tl.load(force_timestamp_ptr + row).to(tl.int1)
+        sample_needed = sample_needed & ~pair_timestamp
+
+    if sample_needed:
+        seed = tl.load(seed_ptr).to(tl.uint32)
+        rng_offsets = row * vocab_size + offsets
+        uniform = tl.rand(seed, rng_offsets)
+        uniform = tl.minimum(tl.maximum(uniform, 1.0e-6), 1.0 - 1.0e-6)
+        gumbel = -tl.log(-tl.log(uniform))
+        sample_scores = constrained / temperature + gumbel
+        sample_max = tl.max(sample_scores, axis=0)
+        sample_indices = tl.where(sample_scores == sample_max, offsets, vocab_size)
+        sample_index = tl.min(sample_indices, axis=0)
+    else:
+        sample_max = -float("inf")
+        sample_index = vocab_size
 
     partial_offset = row * num_blocks + block
     tl.store(partial_logit_max_ptr + partial_offset, logit_max)
@@ -361,6 +378,7 @@ def sample_next_token(
         min_timestamp_tokens if min_timestamp_tokens is not None else dummy,
         force_timestamp if force_timestamp is not None else dummy,
         pair_timestamp if pair_timestamp is not None else dummy,
+        greedy_batch_mask if greedy_batch_mask is not None else dummy,
         seed,
         partial_logit_max,
         partial_greedy_value,
@@ -374,6 +392,7 @@ def sample_next_token(
         has_min_timestamp,
         has_force_timestamp,
         has_pair_timestamp,
+        has_greedy_batch_mask,
         timestamps_after_sentence_end,
         float(temperature),
         block_size,
