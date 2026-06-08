@@ -200,6 +200,8 @@ def _mel_to_hz(mels: torch.Tensor) -> torch.Tensor:
 
 
 _MEL_FILTER_CACHE: dict[int, torch.Tensor] = {}
+_MEL_FILTER_DEVICE_CACHE: dict[tuple[int, str], torch.Tensor] = {}
+_HANN_WINDOW_CACHE: dict[tuple[int, str], torch.Tensor] = {}
 
 
 def _mel_filter_asset_candidates() -> list[Path]:
@@ -256,13 +258,27 @@ def mel_filters(n_mels: int, device: torch.device) -> torch.Tensor:
         else:
             cached = _analytic_mel_filters(n_mels)
         _MEL_FILTER_CACHE[n_mels] = cached
-    return cached.to(device)
+    device_key = (n_mels, str(device))
+    device_cached = _MEL_FILTER_DEVICE_CACHE.get(device_key)
+    if device_cached is None or device_cached.device != device:
+        device_cached = cached.to(device)
+        _MEL_FILTER_DEVICE_CACHE[device_key] = device_cached
+    return device_cached
+
+
+def hann_window(device: torch.device) -> torch.Tensor:
+    cache_key = (N_FFT, str(device))
+    cached = _HANN_WINDOW_CACHE.get(cache_key)
+    if cached is None or cached.device != device:
+        cached = torch.hann_window(N_FFT, device=device)
+        _HANN_WINDOW_CACHE[cache_key] = cached
+    return cached
 
 
 def log_mel_spectrogram(audio: torch.Tensor, n_mels: int) -> torch.Tensor:
     audio = pad_or_trim(audio.float())
 
-    window = torch.hann_window(N_FFT, device=audio.device)
+    window = hann_window(audio.device)
     stft = torch.stft(audio, N_FFT, HOP_LENGTH, window=window, return_complex=True)
     magnitudes = stft[..., :-1].abs() ** 2
     mel_spec = mel_filters(n_mels, audio.device) @ magnitudes

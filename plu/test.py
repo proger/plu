@@ -220,225 +220,6 @@ def load_input_features(filename: Path, n_mels: int, device: torch.device, dtype
     return features.unsqueeze(0).to(device=device, dtype=dtype), duration
 
 
-class Mxfp8CudaGraphSampler:
-    def __init__(
-        self,
-        model: WhisperForConditionalGeneration,
-        tokenizer: WhisperTokenizer,
-        packed: dict[int, object],
-        prompt: list[int],
-        suppress_tokens: list[int],
-    ):
-        self.model = model
-        self.tokenizer = tokenizer
-        self.packed = packed
-        self.prompt = prompt
-        self.device = next(model.parameters()).device
-        self.dtype = next(model.parameters()).dtype
-        self.max_target_positions = model.config.max_target_positions
-        self.hidden_size = model.config.d_model
-        self.encoder_positions = model.config.max_source_positions
-        self.eos_token_id = model.config.eos_token_id
-        self.no_speech_token = tokenizer.no_speech
-        self.timestamp_begin = tokenizer.timestamp_begin
-        self.suppress_tokens = torch.tensor(
-            [token for token in suppress_tokens if 0 <= token < model.config.vocab_size],
-            device=self.device,
-            dtype=torch.long,
-        )
-
-        self.static_encoder_hidden_states = torch.zeros(
-            1,
-            self.encoder_positions,
-            self.hidden_size,
-            device=self.device,
-            dtype=self.dtype,
-        )
-        self.prompt_tensor = torch.tensor(prompt, device=self.device, dtype=torch.long)
-
-        self.bucket_states = []
-        self.capture_ms = 0.0
-        self._capture()
-
-    @torch.no_grad()
-    def _graph_step(self, decoder_ids: torch.Tensor, sample_index: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        from benchmarks.bench_end_to_end import _packed_decoder_layer, _packed_linear
-        from plu.triton.embedding import decoder_embedding
-        from plu.triton.layer_norm import layer_norm
-
-        decoder = self.model.model.decoder
-        hidden_states = decoder_embedding(
-            decoder_ids,
-            decoder.embed_tokens.weight,
-            decoder.embed_positions.weight,
-            self.static_encoder_hidden_states.dtype,
-        )
-        for layer in decoder.layers:
-            hidden_states = _packed_decoder_layer(
-                self.packed,
-                layer,
-                hidden_states,
-                self.static_encoder_hidden_states,
-                decoder.causal_mask,
-                master_weight_grads=False,
-            )
-        decoder_hidden_states = layer_norm(hidden_states, decoder.layer_norm.weight, decoder.layer_norm.bias, decoder.layer_norm.eps)
-        sample_index_expanded = sample_index.view(1, 1, 1).expand(1, 1, self.hidden_size)
-        sampled_hidden = torch.gather(decoder_hidden_states, 1, sample_index_expanded)
-        logits = _packed_linear(self.packed, self.model.proj_out, sampled_hidden, master_weight_grads=False).float().squeeze(1)
-        raw_logprobs = logits.log_softmax(dim=-1)
-        no_speech_prob = raw_logprobs[:, self.no_speech_token].exp()
-        if self.suppress_tokens.numel():
-            logits.index_fill_(1, self.suppress_tokens, -float("inf"))
-        logits[:, self.timestamp_begin :].fill_(-float("inf"))
-        logprobs = logits.log_softmax(dim=-1)
-        next_token = logits.argmax(dim=-1)
-        selected_logprob = logprobs.gather(1, next_token[:, None]).squeeze(1)
-        return next_token, selected_logprob, no_speech_prob
-
-    def _bucket_sizes(self) -> list[int]:
-        sizes = []
-        size = 8
-        while size < self.max_target_positions:
-            if size >= len(self.prompt):
-                sizes.append(size)
-            size *= 2
-        if not sizes or sizes[-1] != self.max_target_positions:
-            sizes.append(self.max_target_positions)
-        return sizes
-
-    def _make_bucket_state(self, size: int) -> dict[str, object]:
-        return {
-            "size": size,
-            "decoder_ids": torch.full((1, size), self.eos_token_id, device=self.device, dtype=torch.long),
-            "sample_index": torch.zeros(1, device=self.device, dtype=torch.long),
-            "graph": None,
-            "next_token": None,
-            "selected_logprob": None,
-            "no_speech_prob": None,
-        }
-
-    def _reset_bucket(self, state: dict[str, object]) -> None:
-        decoder_ids = state["decoder_ids"]
-        assert isinstance(decoder_ids, torch.Tensor)
-        decoder_ids.fill_(self.eos_token_id)
-        prompt_len = min(len(self.prompt), decoder_ids.shape[1])
-        decoder_ids[0, :prompt_len].copy_(self.prompt_tensor[:prompt_len])
-        sample_index = state["sample_index"]
-        assert isinstance(sample_index, torch.Tensor)
-        sample_index.fill_(max(0, prompt_len - 1))
-
-    def _reset_decoder_ids(self) -> None:
-        for state in self.bucket_states:
-            self._reset_bucket(state)
-
-    def _capture(self) -> None:
-        total_capture_ms = 0.0
-        self.bucket_states = [self._make_bucket_state(size) for size in self._bucket_sizes()]
-        for state in self.bucket_states:
-            self._reset_bucket(state)
-            decoder_ids = state["decoder_ids"]
-            sample_index = state["sample_index"]
-            assert isinstance(decoder_ids, torch.Tensor)
-            assert isinstance(sample_index, torch.Tensor)
-            for _ in range(3):
-                self._graph_step(decoder_ids, sample_index)
-            torch.cuda.synchronize()
-
-            graph = torch.cuda.CUDAGraph()
-            capture_start = torch.cuda.Event(enable_timing=True)
-            capture_end = torch.cuda.Event(enable_timing=True)
-            capture_start.record()
-            with torch.cuda.graph(graph):
-                next_token, selected_logprob, no_speech_prob = self._graph_step(decoder_ids, sample_index)
-            capture_end.record()
-            torch.cuda.synchronize()
-
-            state["graph"] = graph
-            state["next_token"] = next_token
-            state["selected_logprob"] = selected_logprob
-            state["no_speech_prob"] = no_speech_prob
-            total_capture_ms += capture_start.elapsed_time(capture_end)
-        self.capture_ms = total_capture_ms
-
-    def copy_encoder_hidden_states(self, encoder_hidden_states: torch.Tensor) -> None:
-        if encoder_hidden_states.shape != self.static_encoder_hidden_states.shape:
-            raise ValueError(
-                "CUDA graph sampler requires static encoder states "
-                f"{tuple(self.static_encoder_hidden_states.shape)}, got {tuple(encoder_hidden_states.shape)}"
-            )
-        self.static_encoder_hidden_states.copy_(encoder_hidden_states)
-
-    def _state_for_token_count(self, token_count: int) -> dict[str, object]:
-        window_tokens = min(token_count, self.max_target_positions)
-        for state in self.bucket_states:
-            size = state["size"]
-            assert isinstance(size, int)
-            if size >= window_tokens:
-                return state
-        return self.bucket_states[-1]
-
-    def _write_generated_token(self, write_position: int, next_token: torch.Tensor) -> None:
-        if write_position < self.max_target_positions:
-            for state in self.bucket_states:
-                size = state["size"]
-                decoder_ids = state["decoder_ids"]
-                assert isinstance(size, int)
-                assert isinstance(decoder_ids, torch.Tensor)
-                if write_position < size:
-                    decoder_ids[0, write_position].copy_(next_token)
-        else:
-            state = self.bucket_states[-1]
-            decoder_ids = state["decoder_ids"]
-            assert isinstance(decoder_ids, torch.Tensor)
-            decoder_ids[:, :-1].copy_(decoder_ids[:, 1:].clone())
-            decoder_ids[0, -1].copy_(next_token)
-
-    def sample(self, encoder_hidden_states: torch.Tensor, max_new_tokens: int) -> tuple[list[int], list[float], float]:
-        if not self.bucket_states:
-            raise RuntimeError("CUDA graph sampler has not been captured")
-
-        self.copy_encoder_hidden_states(encoder_hidden_states)
-        self._reset_decoder_ids()
-        generated: list[int] = []
-        selected_logprobs: list[float] = []
-        no_speech_prob = 0.0
-
-        for step in range(max_new_tokens):
-            token_count = len(self.prompt) + len(generated)
-            state = self._state_for_token_count(token_count)
-            size = state["size"]
-            sample_index = state["sample_index"]
-            graph = state["graph"]
-            next_token_tensor = state["next_token"]
-            selected_logprob_tensor = state["selected_logprob"]
-            no_speech_prob_tensor = state["no_speech_prob"]
-            assert isinstance(size, int)
-            assert isinstance(sample_index, torch.Tensor)
-            assert isinstance(graph, torch.cuda.CUDAGraph)
-            assert isinstance(next_token_tensor, torch.Tensor)
-            assert isinstance(selected_logprob_tensor, torch.Tensor)
-            assert isinstance(no_speech_prob_tensor, torch.Tensor)
-
-            sample_position = min(token_count, size) - 1
-            sample_index.fill_(sample_position)
-            graph.replay()
-
-            next_token_gpu = next_token_tensor[0]
-            if step == 0:
-                no_speech_prob = float(no_speech_prob_tensor[0].detach().cpu())
-            next_token = int(next_token_gpu.detach().cpu())
-            selected_logprobs.append(float(selected_logprob_tensor[0].detach().cpu()))
-
-            self._write_generated_token(token_count, next_token_gpu)
-
-            generated.append(next_token)
-            if next_token == self.eos_token_id:
-                break
-
-        return self.prompt + generated, selected_logprobs, no_speech_prob
-
-
 class Mxfp8KvCacheCudaGraphSampler:
     def __init__(
         self,
@@ -449,14 +230,24 @@ class Mxfp8KvCacheCudaGraphSampler:
         suppress_tokens: list[int],
         decode_batch_size: int = 1,
         timestamps_after_sentence_end: bool = False,
+        cross_cache_batch_size: int | None = None,
+        cross_key_caches: list[torch.Tensor] | None = None,
+        cross_value_caches: list[torch.Tensor] | None = None,
     ):
         if decode_batch_size < 1:
             raise ValueError("--decode_batch_size must be at least 1")
+        if cross_cache_batch_size is None:
+            cross_cache_batch_size = decode_batch_size
+        if cross_cache_batch_size < 1:
+            raise ValueError("cross_cache_batch_size must be at least 1")
+        if (cross_key_caches is None) != (cross_value_caches is None):
+            raise ValueError("cross_key_caches and cross_value_caches must be provided together")
         self.model = model
         self.tokenizer = tokenizer
         self.packed = packed
         self.prompt = prompt
         self.decode_batch_size = decode_batch_size
+        self.cross_cache_batch_size = cross_cache_batch_size
         self.timestamps_after_sentence_end = timestamps_after_sentence_end
         self.device = next(model.parameters()).device
         self.dtype = next(model.parameters()).dtype
@@ -496,15 +287,17 @@ class Mxfp8KvCacheCudaGraphSampler:
             dtype=torch.long,
         )
         self.static_sampling_seed = torch.zeros((), device=self.device, dtype=torch.int64)
+        self._identity_cross_cache_index = torch.arange(self.decode_batch_size, device=self.device, dtype=torch.long)
+        self.static_cross_cache_index = self._identity_cross_cache_index % self.cross_cache_batch_size
+        self._grouped_cross_cache_index_cache: dict[tuple[int, int], torch.Tensor] = {}
         self._sampling_seed_counter = 0
         self.last_page_resample_count = 0
-        self.generated_token_buffer = torch.full(
+        self.generated_token_buffer = torch.empty(
             (self.decode_batch_size, self.max_target_positions),
-            self.eos_token_id,
             device=self.device,
             dtype=torch.long,
         )
-        self.generated_logprob_buffer = torch.zeros(
+        self.generated_logprob_buffer = torch.empty(
             (self.decode_batch_size, self.max_target_positions),
             device=self.device,
             dtype=torch.float32,
@@ -519,7 +312,11 @@ class Mxfp8KvCacheCudaGraphSampler:
         self.self_value_caches = []
         self.cross_key_caches = []
         self.cross_value_caches = []
-        for layer in decoder.layers:
+        if cross_key_caches is not None and len(cross_key_caches) != len(decoder.layers):
+            raise ValueError(f"expected {len(decoder.layers)} shared cross key caches, got {len(cross_key_caches)}")
+        if cross_value_caches is not None and len(cross_value_caches) != len(decoder.layers):
+            raise ValueError(f"expected {len(decoder.layers)} shared cross value caches, got {len(cross_value_caches)}")
+        for layer_index, layer in enumerate(decoder.layers):
             heads = layer.self_attn.num_heads
             head_dim = layer.self_attn.head_dim
             self.self_key_caches.append(
@@ -528,19 +325,43 @@ class Mxfp8KvCacheCudaGraphSampler:
             self.self_value_caches.append(
                 torch.empty((self.decode_batch_size, heads, self.max_target_positions, head_dim), device=self.device, dtype=self.dtype)
             )
-            self.cross_key_caches.append(
-                torch.empty((self.decode_batch_size, heads, self.encoder_positions, head_dim), device=self.device, dtype=self.dtype)
-            )
-            self.cross_value_caches.append(
-                torch.empty((self.decode_batch_size, heads, self.encoder_positions, head_dim), device=self.device, dtype=self.dtype)
-            )
+            expected_cross_shape = (self.cross_cache_batch_size, heads, self.encoder_positions, head_dim)
+            if cross_key_caches is None:
+                self.cross_key_caches.append(torch.empty(expected_cross_shape, device=self.device, dtype=self.dtype))
+                self.cross_value_caches.append(torch.empty(expected_cross_shape, device=self.device, dtype=self.dtype))
+            else:
+                key_cache = cross_key_caches[layer_index]
+                value_cache = cross_value_caches[layer_index]
+                if key_cache.shape != expected_cross_shape or value_cache.shape != expected_cross_shape:
+                    raise ValueError(
+                        "shared cross caches have incompatible shapes "
+                        f"at layer {layer_index}: expected {expected_cross_shape}, got {tuple(key_cache.shape)} and {tuple(value_cache.shape)}"
+                    )
+                if key_cache.device != self.device or value_cache.device != self.device:
+                    raise ValueError("shared cross caches must be on the sampler device")
+                if key_cache.dtype != self.dtype or value_cache.dtype != self.dtype:
+                    raise ValueError("shared cross caches must match the sampler dtype")
+                self.cross_key_caches.append(key_cache)
+                self.cross_value_caches.append(value_cache)
 
         self.graph: torch.cuda.CUDAGraph | None = None
         self.graph_next_token: torch.Tensor | None = None
         self.graph_selected_logprob: torch.Tensor | None = None
         self.graph_no_speech_prob: torch.Tensor | None = None
+        self.prompt_graph: torch.cuda.CUDAGraph | None = None
+        self.prompt_graph_next_token: torch.Tensor | None = None
+        self.prompt_graph_selected_logprob: torch.Tensor | None = None
+        self.prompt_graph_no_speech_prob: torch.Tensor | None = None
         self.capture_ms = 0.0
         self._capture()
+
+    def _grouped_cross_cache_index(self, prompt_count: int, alternatives_per_prompt: int) -> torch.Tensor:
+        key = (prompt_count, alternatives_per_prompt)
+        cached = self._grouped_cross_cache_index_cache.get(key)
+        if cached is None:
+            cached = torch.arange(prompt_count, device=self.device, dtype=torch.long).repeat_interleave(alternatives_per_prompt)
+            self._grouped_cross_cache_index_cache[key] = cached
+        return cached
 
     def _project_heads(self, module: torch.nn.Module, hidden_states: torch.Tensor) -> torch.Tensor:
         from benchmarks.bench_end_to_end import _packed_linear
@@ -571,9 +392,13 @@ class Mxfp8KvCacheCudaGraphSampler:
             value = _packed_qkv(self.packed, layer.encoder_attn.v_proj, encoder_hidden_states, layer.encoder_attn.num_heads, master_weight_grads=False)
             key_cache = self.cross_key_caches[index]
             value_cache = self.cross_value_caches[index]
-            if key.shape[0] == 1 and self.decode_batch_size > 1:
+            if key.shape[0] == 1 and self.cross_cache_batch_size > 1:
                 key = key.expand_as(key_cache)
                 value = value.expand_as(value_cache)
+            elif key.shape[0] != self.cross_cache_batch_size and self.cross_cache_batch_size % key.shape[0] == 0:
+                repeats = self.cross_cache_batch_size // key.shape[0]
+                key = key.repeat_interleave(repeats, dim=0)
+                value = value.repeat_interleave(repeats, dim=0)
             if key.shape != key_cache.shape or value.shape != value_cache.shape:
                 raise ValueError(
                     "KV-cache sampler requires static encoder cache shapes "
@@ -583,7 +408,7 @@ class Mxfp8KvCacheCudaGraphSampler:
             value_cache.copy_(value)
 
     @torch.no_grad()
-    def _decoder_step(self) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    def _decoder_step(self, *, compute_no_speech: bool = False) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         from benchmarks.bench_end_to_end import _packed_gelu_mlp, _packed_linear
         from plu.triton.decode_attention import cross_kv_cache_attention, self_kv_cache_attention
         from plu.triton.layer_norm import layer_norm
@@ -611,7 +436,8 @@ class Mxfp8KvCacheCudaGraphSampler:
             residual = hidden_states
             normed = layer_norm(hidden_states, layer.encoder_attn_layer_norm.weight, layer.encoder_attn_layer_norm.bias, layer.encoder_attn_layer_norm.eps)
             query = self._project_heads(layer.encoder_attn.q_proj, normed)
-            attended = cross_kv_cache_attention(query, self.cross_key_caches[index], self.cross_value_caches[index])
+            cross_cache_index = self.static_cross_cache_index if self.cross_cache_batch_size != self.decode_batch_size else None
+            attended = cross_kv_cache_attention(query, self.cross_key_caches[index], self.cross_value_caches[index], cross_cache_index)
             hidden_states = _packed_linear(self.packed, layer.encoder_attn.out_proj, self._merge_heads(attended), master_weight_grads=False)
             hidden_states = residual_add(residual, hidden_states)
 
@@ -622,8 +448,11 @@ class Mxfp8KvCacheCudaGraphSampler:
 
         decoder_hidden_states = layer_norm(hidden_states, decoder.layer_norm.weight, decoder.layer_norm.bias, decoder.layer_norm.eps)
         logits = _packed_linear(self.packed, self.model.proj_out, decoder_hidden_states, master_weight_grads=False).float().squeeze(1)
-        raw_logprobs = logits.log_softmax(dim=-1)
-        no_speech_prob = raw_logprobs[:, self.no_speech_token].exp()
+        if compute_no_speech:
+            raw_logprobs = logits.log_softmax(dim=-1)
+            no_speech_prob = raw_logprobs[:, self.no_speech_token].exp()
+        else:
+            no_speech_prob = logits.new_zeros((self.decode_batch_size,), dtype=torch.float32)
         next_token, selected_logprob = sample_next_token(
             logits,
             timestamp_begin=self.timestamp_begin,
@@ -652,20 +481,26 @@ class Mxfp8KvCacheCudaGraphSampler:
         torch.cuda.synchronize()
 
         graph = torch.cuda.CUDAGraph()
+        prompt_graph = torch.cuda.CUDAGraph()
         capture_start = torch.cuda.Event(enable_timing=True)
         capture_end = torch.cuda.Event(enable_timing=True)
         capture_start.record()
         with torch.cuda.graph(graph):
-            self.graph_next_token, self.graph_selected_logprob, self.graph_no_speech_prob = self._decoder_step()
+            self.graph_next_token, self.graph_selected_logprob, self.graph_no_speech_prob = self._decoder_step(compute_no_speech=False)
+        with torch.cuda.graph(prompt_graph):
+            self.prompt_graph_next_token, self.prompt_graph_selected_logprob, self.prompt_graph_no_speech_prob = self._decoder_step(
+                compute_no_speech=True
+            )
         capture_end.record()
         torch.cuda.synchronize()
         self.graph = graph
+        self.prompt_graph = prompt_graph
         self.capture_ms = capture_start.elapsed_time(capture_end)
 
     def _set_replay_inputs(
         self,
         tokens: int | list[int] | torch.Tensor,
-        position: int,
+        position: int | list[int] | torch.Tensor,
         *,
         force_timestamps: bool | list[bool] | torch.Tensor = False,
         pair_timestamps: bool | list[bool] | torch.Tensor = False,
@@ -680,7 +515,14 @@ class Mxfp8KvCacheCudaGraphSampler:
             if len(tokens) != self.decode_batch_size:
                 raise ValueError(f"expected {self.decode_batch_size} tokens, got {len(tokens)}")
             self.static_current_token.copy_(torch.tensor(tokens, device=self.device, dtype=torch.long))
-        self.static_position.fill_(position)
+        if isinstance(position, int):
+            self.static_position.fill_(position)
+        elif isinstance(position, torch.Tensor):
+            self.static_position.copy_(position.to(device=self.device, dtype=torch.long))
+        else:
+            if len(position) != self.decode_batch_size:
+                raise ValueError(f"expected {self.decode_batch_size} positions, got {len(position)}")
+            self.static_position.copy_(torch.tensor(position, device=self.device, dtype=torch.long))
         if isinstance(force_timestamps, bool):
             self.static_force_timestamp.fill_(force_timestamps)
         elif isinstance(force_timestamps, torch.Tensor):
@@ -721,15 +563,23 @@ class Mxfp8KvCacheCudaGraphSampler:
     def _replay_device(
         self,
         tokens: int | list[int] | torch.Tensor,
-        position: int,
+        position: int | list[int] | torch.Tensor,
         *,
         force_timestamps: bool | list[bool] | torch.Tensor = False,
         pair_timestamps: bool | list[bool] | torch.Tensor = False,
         pair_timestamp_tokens: int | list[int] | torch.Tensor | None = None,
         min_timestamp_tokens: int | list[int] | torch.Tensor | None = None,
+        compute_no_speech: bool = False,
     ) -> None:
         if self.graph is None or self.graph_next_token is None or self.graph_selected_logprob is None or self.graph_no_speech_prob is None:
             raise RuntimeError("CUDA graph sampler has not been captured")
+        if compute_no_speech and (
+            self.prompt_graph is None
+            or self.prompt_graph_next_token is None
+            or self.prompt_graph_selected_logprob is None
+            or self.prompt_graph_no_speech_prob is None
+        ):
+            raise RuntimeError("prompt CUDA graph sampler has not been captured")
         self._set_replay_inputs(
             tokens,
             position,
@@ -740,12 +590,22 @@ class Mxfp8KvCacheCudaGraphSampler:
         )
         self._sampling_seed_counter = (self._sampling_seed_counter + 1) & 0x7FFFFFFF
         self.static_sampling_seed.fill_(self._sampling_seed_counter)
-        self.graph.replay()
+        if compute_no_speech:
+            assert self.prompt_graph is not None
+            assert self.prompt_graph_next_token is not None
+            assert self.prompt_graph_selected_logprob is not None
+            assert self.prompt_graph_no_speech_prob is not None
+            self.prompt_graph.replay()
+            self.graph_next_token.copy_(self.prompt_graph_next_token)
+            self.graph_selected_logprob.copy_(self.prompt_graph_selected_logprob)
+            self.graph_no_speech_prob.copy_(self.prompt_graph_no_speech_prob)
+        else:
+            self.graph.replay()
 
     def _replay(
         self,
         tokens: int | list[int] | torch.Tensor,
-        position: int,
+        position: int | list[int] | torch.Tensor,
         *,
         force_timestamps: bool | list[bool] | torch.Tensor = False,
         pair_timestamps: bool | list[bool] | torch.Tensor = False,
@@ -776,20 +636,26 @@ class Mxfp8KvCacheCudaGraphSampler:
     ) -> list[tuple[list[int], list[float], float]]:
         if self.graph is None or self.graph_next_token is None or self.graph_selected_logprob is None or self.graph_no_speech_prob is None:
             raise RuntimeError("CUDA graph sampler has not been captured")
+        if encoder_hidden_states.shape[0] == 1:
+            self.static_cross_cache_index.zero_()
+        elif encoder_hidden_states.shape[0] == self.decode_batch_size and self.cross_cache_batch_size == self.decode_batch_size:
+            self.static_cross_cache_index.copy_(self._identity_cross_cache_index)
+        else:
+            raise ValueError(
+                "sample_many expects one encoder batch shared by all rows, or one encoder batch per row "
+                f"with full cross cache; got encoder batch {encoder_hidden_states.shape[0]} and cross cache batch {self.cross_cache_batch_size}"
+            )
         self.prepare_encoder(encoder_hidden_states)
         self.last_page_resample_count = 0
-        for key_cache, value_cache in zip(self.self_key_caches, self.self_value_caches):
-            key_cache.zero_()
-            value_cache.zero_()
 
         prompt = self.prompt if prompt is None else prompt
         prompt_len = min(len(prompt), self.max_target_positions)
-        self.generated_token_buffer.fill_(self.eos_token_id)
-        self.generated_logprob_buffer.zero_()
         self.generated_lengths.zero_()
         self.finished.zero_()
         self.no_speech_probs.zero_()
         self.all_finished.fill_(False)
+        self.greedy_batch_mask.zero_()
+        self.greedy_batch_mask[0] = True
         self.static_current_token.fill_(self.eos_token_id)
         self.static_position.zero_()
         self.static_force_timestamp.zero_()
@@ -806,6 +672,7 @@ class Mxfp8KvCacheCudaGraphSampler:
                 pair_timestamps=False,
                 pair_timestamp_tokens=self.timestamp_begin,
                 min_timestamp_tokens=self.timestamp_begin,
+                compute_no_speech=position == prompt_len - 1,
             )
             if position == prompt_len - 1:
                 self.no_speech_probs.copy_(self.graph_no_speech_prob)
@@ -859,6 +726,381 @@ class Mxfp8KvCacheCudaGraphSampler:
             for index, length in enumerate(lengths)
         ]
 
+    def sample_many_grouped(
+        self,
+        encoder_hidden_states: torch.Tensor,
+        max_new_tokens: int,
+        prompts: list[list[int]],
+        alternatives_per_prompt: int,
+        stop_after_first_sentence: bool = False,
+    ) -> list[list[tuple[list[int], list[float], float]]]:
+        if self.graph is None or self.graph_next_token is None or self.graph_selected_logprob is None or self.graph_no_speech_prob is None:
+            raise RuntimeError("CUDA graph sampler has not been captured")
+        if alternatives_per_prompt < 1:
+            raise ValueError("alternatives_per_prompt must be at least 1")
+        if not prompts:
+            return []
+        if len(prompts) * alternatives_per_prompt != self.decode_batch_size:
+            raise ValueError(
+                "grouped sampling requires decode_batch_size == len(prompts) * alternatives_per_prompt, "
+                f"got {self.decode_batch_size}, {len(prompts)}, {alternatives_per_prompt}"
+            )
+        if encoder_hidden_states.shape[0] != len(prompts):
+            raise ValueError(f"expected {len(prompts)} encoder batches, got {encoder_hidden_states.shape[0]}")
+        if self.cross_cache_batch_size < len(prompts):
+            raise ValueError(f"cross cache batch {self.cross_cache_batch_size} is smaller than prompt batch {len(prompts)}")
+        self.static_cross_cache_index.copy_(self._grouped_cross_cache_index(len(prompts), alternatives_per_prompt))
+
+        self.prepare_encoder(encoder_hidden_states)
+        self.last_page_resample_count = 0
+
+        prompts = [prompt[: self.max_target_positions] for prompt in prompts]
+        if any(not prompt for prompt in prompts):
+            raise ValueError("prompts must not be empty")
+        prompt_lens = torch.tensor(
+            [len(prompt) for prompt in prompts for _ in range(alternatives_per_prompt)],
+            device=self.device,
+            dtype=torch.long,
+        )
+        max_prompt_len = int(prompt_lens.max().item())
+
+        self.generated_lengths.zero_()
+        self.finished.zero_()
+        self.no_speech_probs.zero_()
+        self.all_finished.fill_(False)
+        self.greedy_batch_mask.zero_()
+        self.greedy_batch_mask[::alternatives_per_prompt] = True
+        self.static_current_token.fill_(self.eos_token_id)
+        self.static_position.zero_()
+        self.static_force_timestamp.zero_()
+        self.static_pair_timestamp.zero_()
+        self.static_pair_timestamp_token.fill_(self.timestamp_begin)
+        self.static_min_timestamp.fill_(self.timestamp_begin)
+
+        saved_next_tokens = torch.empty(self.decode_batch_size, device=self.device, dtype=torch.long)
+        saved_logprobs = torch.empty(self.decode_batch_size, device=self.device, dtype=torch.float32)
+        saved_no_speech = torch.empty(self.decode_batch_size, device=self.device, dtype=torch.float32)
+        saved_next_tokens.fill_(self.eos_token_id)
+        saved_logprobs.zero_()
+        saved_no_speech.zero_()
+
+        prompt_token_rows: list[list[int]] = []
+        prompt_position_rows: list[list[int]] = []
+        prompt_force_timestamp_rows: list[list[bool]] = []
+        prompt_final_rows: list[list[bool]] = []
+        prompt_has_final_rows: list[bool] = []
+        for position in range(max_prompt_len):
+            tokens_row: list[int] = []
+            positions_row: list[int] = []
+            force_timestamps_row: list[bool] = []
+            final_row: list[bool] = []
+            for prompt in prompts:
+                prompt_position = min(position, len(prompt) - 1)
+                force_timestamp = self.timestamps_after_sentence_end and position == len(prompt) - 1
+                final_prompt_position = position == len(prompt) - 1
+                for _ in range(alternatives_per_prompt):
+                    tokens_row.append(int(prompt[prompt_position]))
+                    positions_row.append(prompt_position)
+                    force_timestamps_row.append(force_timestamp)
+                    final_row.append(final_prompt_position)
+            prompt_token_rows.append(tokens_row)
+            prompt_position_rows.append(positions_row)
+            prompt_force_timestamp_rows.append(force_timestamps_row)
+            prompt_final_rows.append(final_row)
+            prompt_has_final_rows.append(any(final_row))
+
+        prompt_tokens = torch.tensor(prompt_token_rows, device=self.device, dtype=torch.long)
+        prompt_positions = torch.tensor(prompt_position_rows, device=self.device, dtype=torch.long)
+        prompt_force_timestamps = torch.tensor(prompt_force_timestamp_rows, device=self.device, dtype=torch.bool)
+        prompt_final_masks = torch.tensor(prompt_final_rows, device=self.device, dtype=torch.bool)
+
+        for position in range(max_prompt_len):
+            self._replay_device(
+                prompt_tokens[position],
+                prompt_positions[position],
+                force_timestamps=prompt_force_timestamps[position],
+                pair_timestamps=False,
+                pair_timestamp_tokens=self.timestamp_begin,
+                min_timestamp_tokens=self.timestamp_begin,
+                compute_no_speech=prompt_has_final_rows[position],
+            )
+            if prompt_has_final_rows[position]:
+                final_prompt_rows = prompt_final_masks[position]
+                saved_next_tokens.copy_(torch.where(final_prompt_rows, self.graph_next_token, saved_next_tokens))
+                saved_logprobs.copy_(torch.where(final_prompt_rows, self.graph_selected_logprob, saved_logprobs))
+                saved_no_speech.copy_(torch.where(final_prompt_rows, self.graph_no_speech_prob, saved_no_speech))
+
+        self.graph_next_token.copy_(saved_next_tokens)
+        self.graph_selected_logprob.copy_(saved_logprobs)
+        self.no_speech_probs.copy_(saved_no_speech)
+
+        max_steps = min(max_new_tokens, self.generated_token_buffer.shape[1])
+        if max_steps > 0:
+            finish_check_interval = 8
+            self.static_position.copy_(prompt_lens - 1)
+            for step in range(max_steps):
+                update_decode_control_(
+                    self.graph_next_token,
+                    self.graph_selected_logprob,
+                    self.generated_token_buffer,
+                    self.generated_logprob_buffer,
+                    self.generated_lengths,
+                    self.finished,
+                    self.static_current_token,
+                    self.static_force_timestamp,
+                    self.static_pair_timestamp,
+                    self.static_pair_timestamp_token,
+                    self.static_min_timestamp,
+                    self.static_position,
+                    self.static_sampling_seed,
+                    self.all_finished,
+                    self.sentence_end_token_mask,
+                    eos_token_id=self.eos_token_id,
+                    timestamp_begin=self.timestamp_begin,
+                    timestamps_after_sentence_end=self.timestamps_after_sentence_end,
+                    stop_after_first_sentence=stop_after_first_sentence,
+                )
+                must_stop_for_length = step + 1 >= max_steps or max_prompt_len + step >= self.max_target_positions
+                check_finished = must_stop_for_length or (step + 1) % finish_check_interval == 0
+                if check_finished and bool(self.all_finished.detach().cpu().item()):
+                    break
+                if must_stop_for_length:
+                    break
+                self.graph.replay()
+
+        lengths = self.generated_lengths.detach().cpu().tolist()
+        generated_tokens = self.generated_token_buffer.detach().cpu()
+        generated_logprobs = self.generated_logprob_buffer.detach().cpu()
+        no_speech_probs = self.no_speech_probs.detach().cpu().tolist()
+        self._sampling_seed_counter = int(self.static_sampling_seed.detach().cpu().item())
+
+        grouped: list[list[tuple[list[int], list[float], float]]] = []
+        for prompt_index, prompt in enumerate(prompts):
+            group: list[tuple[list[int], list[float], float]] = []
+            row_start = prompt_index * alternatives_per_prompt
+            for row in range(row_start, row_start + alternatives_per_prompt):
+                length = lengths[row]
+                group.append(
+                    (
+                        prompt + generated_tokens[row, :length].tolist(),
+                        generated_logprobs[row, :length].tolist(),
+                        no_speech_probs[row],
+                    )
+                )
+            grouped.append(group)
+        return grouped
+
+    def prefill_prompt_caches(self, encoder_hidden_states: torch.Tensor, prompts: list[list[int]]) -> torch.Tensor:
+        if self.graph is None or self.graph_next_token is None or self.graph_selected_logprob is None or self.graph_no_speech_prob is None:
+            raise RuntimeError("CUDA graph sampler has not been captured")
+        if not prompts:
+            raise ValueError("prompts must not be empty")
+        if len(prompts) != self.decode_batch_size:
+            raise ValueError(f"expected {self.decode_batch_size} prompts, got {len(prompts)}")
+        if encoder_hidden_states.shape[0] != len(prompts):
+            raise ValueError(f"expected {len(prompts)} encoder batches, got {encoder_hidden_states.shape[0]}")
+        if self.cross_cache_batch_size < len(prompts):
+            raise ValueError(f"cross cache batch {self.cross_cache_batch_size} is smaller than prompt batch {len(prompts)}")
+        self.static_cross_cache_index.copy_(self._identity_cross_cache_index[: len(prompts)])
+        self.prepare_encoder(encoder_hidden_states)
+
+        prompts = [prompt[: self.max_target_positions] for prompt in prompts]
+        if any(not prompt for prompt in prompts):
+            raise ValueError("prompts must not be empty")
+        prompt_lens = torch.tensor([len(prompt) for prompt in prompts], device=self.device, dtype=torch.long)
+        max_nonfinal_len = max(max(len(prompt) - 1, 0) for prompt in prompts)
+        if max_nonfinal_len == 0:
+            return prompt_lens
+
+        prompt_token_rows: list[list[int]] = []
+        prompt_position_rows: list[list[int]] = []
+        for position in range(max_nonfinal_len):
+            tokens_row: list[int] = []
+            positions_row: list[int] = []
+            for prompt in prompts:
+                prompt_position = min(position, max(len(prompt) - 2, 0))
+                tokens_row.append(int(prompt[prompt_position]))
+                positions_row.append(prompt_position)
+            prompt_token_rows.append(tokens_row)
+            prompt_position_rows.append(positions_row)
+
+        prompt_tokens = torch.tensor(prompt_token_rows, device=self.device, dtype=torch.long)
+        prompt_positions = torch.tensor(prompt_position_rows, device=self.device, dtype=torch.long)
+        for position in range(max_nonfinal_len):
+            self._replay_device(
+                prompt_tokens[position],
+                prompt_positions[position],
+                force_timestamps=False,
+                pair_timestamps=False,
+                pair_timestamp_tokens=self.timestamp_begin,
+                min_timestamp_tokens=self.timestamp_begin,
+            )
+        return prompt_lens
+
+    def sample_many_grouped_compact_prefill(
+        self,
+        prefill_sampler: "Mxfp8KvCacheCudaGraphSampler",
+        encoder_hidden_states: torch.Tensor,
+        max_new_tokens: int,
+        prompts: list[list[int]],
+        alternatives_per_prompt: int,
+        stop_after_first_sentence: bool = False,
+    ) -> list[list[tuple[list[int], list[float], float]]]:
+        if self.graph is None or self.graph_next_token is None or self.graph_selected_logprob is None or self.graph_no_speech_prob is None:
+            raise RuntimeError("CUDA graph sampler has not been captured")
+        if alternatives_per_prompt < 1:
+            raise ValueError("alternatives_per_prompt must be at least 1")
+        if not prompts:
+            return []
+        prompts = [prompt[: self.max_target_positions] for prompt in prompts]
+        if any(not prompt for prompt in prompts):
+            raise ValueError("prompts must not be empty")
+        if len(prompts) * alternatives_per_prompt != self.decode_batch_size:
+            raise ValueError(
+                "grouped sampling requires decode_batch_size == len(prompts) * alternatives_per_prompt, "
+                f"got {self.decode_batch_size}, {len(prompts)}, {alternatives_per_prompt}"
+            )
+        if prefill_sampler.decode_batch_size != len(prompts):
+            raise ValueError(f"prefill sampler batch must be {len(prompts)}, got {prefill_sampler.decode_batch_size}")
+        if encoder_hidden_states.shape[0] != len(prompts):
+            raise ValueError(f"expected {len(prompts)} encoder batches, got {encoder_hidden_states.shape[0]}")
+        if self.cross_cache_batch_size < len(prompts):
+            raise ValueError(f"cross cache batch {self.cross_cache_batch_size} is smaller than prompt batch {len(prompts)}")
+
+        self.static_cross_cache_index.copy_(self._grouped_cross_cache_index(len(prompts), alternatives_per_prompt))
+        prefill_prompt_lens = prefill_sampler.prefill_prompt_caches(encoder_hidden_states, prompts)
+        cross_caches_shared = all(
+            key_cache.data_ptr() == source_key_cache.data_ptr() and value_cache.data_ptr() == source_value_cache.data_ptr()
+            for key_cache, value_cache, source_key_cache, source_value_cache in zip(
+                self.cross_key_caches,
+                self.cross_value_caches,
+                prefill_sampler.cross_key_caches,
+                prefill_sampler.cross_value_caches,
+            )
+        )
+        if not cross_caches_shared:
+            for key_cache, value_cache, source_key_cache, source_value_cache in zip(
+                self.cross_key_caches,
+                self.cross_value_caches,
+                prefill_sampler.cross_key_caches,
+                prefill_sampler.cross_value_caches,
+            ):
+                key_cache.copy_(source_key_cache)
+                value_cache.copy_(source_value_cache)
+        prompt_lens = prefill_prompt_lens.repeat_interleave(alternatives_per_prompt)
+        max_prompt_len = int(prompt_lens.max().item())
+
+        self.generated_lengths.zero_()
+        self.finished.zero_()
+        self.no_speech_probs.zero_()
+        self.all_finished.fill_(False)
+        self.greedy_batch_mask.zero_()
+        self.greedy_batch_mask[::alternatives_per_prompt] = True
+        self.static_current_token.fill_(self.eos_token_id)
+        self.static_position.zero_()
+        self.static_force_timestamp.zero_()
+        self.static_pair_timestamp.zero_()
+        self.static_pair_timestamp_token.fill_(self.timestamp_begin)
+        self.static_min_timestamp.fill_(self.timestamp_begin)
+
+        max_nonfinal_len = max(max(len(prompt) - 1, 0) for prompt in prompts)
+        for layer_index, (key_cache, value_cache) in enumerate(zip(self.self_key_caches, self.self_value_caches)):
+            source_key_cache = prefill_sampler.self_key_caches[layer_index]
+            source_value_cache = prefill_sampler.self_value_caches[layer_index]
+            if max_nonfinal_len == 0:
+                continue
+            for prompt_index, prompt in enumerate(prompts):
+                nonfinal_len = max(len(prompt) - 1, 0)
+                if nonfinal_len == 0:
+                    continue
+                row_start = prompt_index * alternatives_per_prompt
+                row_end = row_start + alternatives_per_prompt
+                key_cache[row_start:row_end, :, :nonfinal_len, :].copy_(
+                    source_key_cache[prompt_index : prompt_index + 1, :, :nonfinal_len, :].expand(alternatives_per_prompt, -1, -1, -1)
+                )
+                value_cache[row_start:row_end, :, :nonfinal_len, :].copy_(
+                    source_value_cache[prompt_index : prompt_index + 1, :, :nonfinal_len, :].expand(alternatives_per_prompt, -1, -1, -1)
+                )
+
+        final_tokens = torch.tensor(
+            [int(prompt[-1]) for prompt in prompts for _ in range(alternatives_per_prompt)],
+            device=self.device,
+            dtype=torch.long,
+        )
+        final_positions = prompt_lens - 1
+        force_timestamps = torch.full(
+            (self.decode_batch_size,),
+            self.timestamps_after_sentence_end,
+            device=self.device,
+            dtype=torch.bool,
+        )
+        self._replay_device(
+            final_tokens,
+            final_positions,
+            force_timestamps=force_timestamps,
+            pair_timestamps=False,
+            pair_timestamp_tokens=self.timestamp_begin,
+            min_timestamp_tokens=self.timestamp_begin,
+            compute_no_speech=True,
+        )
+        self.no_speech_probs.copy_(self.graph_no_speech_prob)
+
+        max_steps = min(max_new_tokens, self.generated_token_buffer.shape[1])
+        if max_steps > 0:
+            finish_check_interval = 8
+            self.static_position.copy_(final_positions)
+            for step in range(max_steps):
+                update_decode_control_(
+                    self.graph_next_token,
+                    self.graph_selected_logprob,
+                    self.generated_token_buffer,
+                    self.generated_logprob_buffer,
+                    self.generated_lengths,
+                    self.finished,
+                    self.static_current_token,
+                    self.static_force_timestamp,
+                    self.static_pair_timestamp,
+                    self.static_pair_timestamp_token,
+                    self.static_min_timestamp,
+                    self.static_position,
+                    self.static_sampling_seed,
+                    self.all_finished,
+                    self.sentence_end_token_mask,
+                    eos_token_id=self.eos_token_id,
+                    timestamp_begin=self.timestamp_begin,
+                    timestamps_after_sentence_end=self.timestamps_after_sentence_end,
+                    stop_after_first_sentence=stop_after_first_sentence,
+                )
+                must_stop_for_length = step + 1 >= max_steps or max_prompt_len + step >= self.max_target_positions
+                check_finished = must_stop_for_length or (step + 1) % finish_check_interval == 0
+                if check_finished and bool(self.all_finished.detach().cpu().item()):
+                    break
+                if must_stop_for_length:
+                    break
+                self.graph.replay()
+
+        lengths = self.generated_lengths.detach().cpu().tolist()
+        generated_tokens = self.generated_token_buffer.detach().cpu()
+        generated_logprobs = self.generated_logprob_buffer.detach().cpu()
+        no_speech_probs = self.no_speech_probs.detach().cpu().tolist()
+        self._sampling_seed_counter = int(self.static_sampling_seed.detach().cpu().item())
+
+        grouped: list[list[tuple[list[int], list[float], float]]] = []
+        for prompt_index, prompt in enumerate(prompts):
+            group: list[tuple[list[int], list[float], float]] = []
+            row_start = prompt_index * alternatives_per_prompt
+            for row in range(row_start, row_start + alternatives_per_prompt):
+                length = lengths[row]
+                group.append(
+                    (
+                        prompt + generated_tokens[row, :length].tolist(),
+                        generated_logprobs[row, :length].tolist(),
+                        no_speech_probs[row],
+                    )
+                )
+            grouped.append(group)
+        return grouped
+
     def sample(
         self,
         encoder_hidden_states: torch.Tensor,
@@ -885,62 +1127,6 @@ def encode_packed_mxfp8(model: WhisperForConditionalGeneration, packed: dict[int
     for layer in encoder.layers:
         hidden_states = _packed_encoder_layer(packed, layer, hidden_states, master_weight_grads=False)
     return layer_norm(hidden_states, encoder.layer_norm.weight, encoder.layer_norm.bias, encoder.layer_norm.eps)
-
-
-@torch.no_grad()
-def decode_packed_mxfp8(
-    model: WhisperForConditionalGeneration,
-    packed: dict[int, object],
-    encoder_hidden_states: torch.Tensor,
-    prompt: list[int],
-    max_new_tokens: int,
-    timestamp_begin: int,
-    no_speech_token: int,
-    suppress_tokens: list[int],
-) -> tuple[list[int], list[float], float]:
-    from benchmarks.bench_end_to_end import _packed_decoder_layer, _packed_linear
-    from plu.triton.embedding import decoder_embedding
-    from plu.triton.layer_norm import layer_norm
-
-    decoder = model.model.decoder
-    tokens = torch.tensor([prompt], device=encoder_hidden_states.device, dtype=torch.long)
-    selected_logprobs: list[float] = []
-    no_speech_prob = 0.0
-
-    for step in range(max_new_tokens):
-        decoder_input_ids = tokens[:, -decoder.config.max_target_positions :]
-        hidden_states = decoder_embedding(
-            decoder_input_ids,
-            decoder.embed_tokens.weight,
-            decoder.embed_positions.weight,
-            encoder_hidden_states.dtype,
-        )
-        for layer in decoder.layers:
-            hidden_states = _packed_decoder_layer(
-                packed,
-                layer,
-                hidden_states,
-                encoder_hidden_states,
-                decoder.causal_mask,
-                master_weight_grads=False,
-            )
-        decoder_hidden_states = layer_norm(hidden_states, decoder.layer_norm.weight, decoder.layer_norm.bias, decoder.layer_norm.eps)
-        logits = _packed_linear(packed, model.proj_out, decoder_hidden_states[:, -1:], master_weight_grads=False).float().squeeze(1)
-        raw_logprobs = logits.log_softmax(dim=-1)
-        if step == 0 and 0 <= no_speech_token < raw_logprobs.shape[-1]:
-            no_speech_prob = float(raw_logprobs[0, no_speech_token].exp().detach().cpu())
-        if suppress_tokens:
-            valid_suppress_tokens = [token for token in suppress_tokens if 0 <= token < logits.shape[-1]]
-            logits[:, valid_suppress_tokens] = -float("inf")
-        logits[:, timestamp_begin:] = -float("inf")
-        logprobs = logits.log_softmax(dim=-1)
-        next_token = logits.argmax(dim=-1)
-        selected_logprobs.append(float(logprobs.gather(1, next_token[:, None]).squeeze().detach().cpu()))
-        tokens = torch.cat([tokens, next_token[:, None]], dim=1)
-        if int(next_token.item()) == model.config.eos_token_id:
-            break
-
-    return tokens[0].detach().cpu().tolist(), selected_logprobs, no_speech_prob
 
 
 def recognize(
