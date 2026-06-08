@@ -49,7 +49,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--hop-seconds", type=float, default=15.0)
     parser.add_argument("--min-window-seconds", type=float, default=1.0)
     parser.add_argument("--decode-batch-size", type=int, default=8, help="Alternatives per window.")
-    parser.add_argument("--window-batch-size", type=int, default=4, help="Independent windows decoded per sampler call.")
+    parser.add_argument("--window-batch-size", type=int, default=16, help="Independent windows decoded per sampler call.")
     parser.add_argument("--audio-load-workers", type=int, default=1, help="Parallel audio preload workers. Runtime is included in elapsed time.")
     parser.add_argument("--max-new-tokens", type=int, default=448)
     parser.add_argument("--timestamps-after-sentence-end", action="store_true")
