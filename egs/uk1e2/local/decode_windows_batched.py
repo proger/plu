@@ -75,12 +75,36 @@ def make_state(file_index: int, recording_id: str, source: str) -> dict[str, obj
     }
 
 
-def load_states(rows: list[tuple[str, str]], workers: int) -> list[dict[str, object]]:
-    if workers <= 1:
-        return [make_state(index, recording_id, source) for index, (recording_id, source) in enumerate(rows)]
-    with ThreadPoolExecutor(max_workers=workers) as executor:
-        futures = [executor.submit(make_state, index, recording_id, source) for index, (recording_id, source) in enumerate(rows)]
-        return [future.result() for future in futures]
+class AsyncStateLoader:
+    def __init__(self, rows: list[tuple[str, str]], workers: int):
+        self.rows = rows
+        self.wait_seconds = 0.0
+        self.executor = ThreadPoolExecutor(max_workers=workers) if workers > 1 else None
+        self.futures = (
+            [
+                self.executor.submit(make_state, index, recording_id, source)
+                for index, (recording_id, source) in enumerate(rows)
+            ]
+            if self.executor is not None
+            else []
+        )
+
+    def __len__(self) -> int:
+        return len(self.rows)
+
+    def get(self, index: int) -> dict[str, object]:
+        start = time.perf_counter()
+        if self.executor is None:
+            recording_id, source = self.rows[index]
+            state = make_state(index, recording_id, source)
+        else:
+            state = self.futures[index].result()
+        self.wait_seconds += time.perf_counter() - start
+        return state
+
+    def close(self) -> None:
+        if self.executor is not None:
+            self.executor.shutdown(wait=False, cancel_futures=True)
 
 
 def batched_log_mel_spectrogram(
@@ -292,9 +316,8 @@ def main() -> None:
     )
 
     start_time = time.perf_counter()
-    load_start = time.perf_counter()
-    states = load_states(rows, args.audio_load_workers)
-    total_audio_load_seconds = time.perf_counter() - load_start
+    state_loader = AsyncStateLoader(rows, args.audio_load_workers)
+    total_audio_load_seconds = 0.0
     row_cursor = 0
     active: list[dict[str, object]] = []
     total_audio_seconds = 0.0
@@ -320,9 +343,10 @@ def main() -> None:
         stage_events = tuple(torch.cuda.Event(enable_timing=True) for _ in range(6))
 
     def fill_active() -> None:
-        nonlocal row_cursor, total_audio_seconds
-        while len(active) < args.window_batch_size and row_cursor < len(states):
-            state = states[row_cursor]
+        nonlocal row_cursor, total_audio_seconds, total_audio_load_seconds
+        while len(active) < args.window_batch_size and row_cursor < len(state_loader):
+            state = state_loader.get(row_cursor)
+            total_audio_load_seconds = state_loader.wait_seconds
             total_audio_seconds += float(state["duration"])
             active.append(state)
             row_cursor += 1
@@ -594,6 +618,7 @@ def main() -> None:
                 )
             fill_active()
 
+    state_loader.close()
     elapsed_seconds = time.perf_counter() - start_time
     summary = {
         "recordings": len(rows),
