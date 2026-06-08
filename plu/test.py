@@ -474,6 +474,19 @@ class Mxfp8KvCacheCudaGraphSampler:
         pair_timestamp_tokens: int | list[int] | torch.Tensor | None = None,
         min_timestamp_tokens: int | list[int] | torch.Tensor | None = None,
     ) -> None:
+        self._set_replay_token_position(tokens, position)
+        self._set_replay_control(
+            force_timestamps=force_timestamps,
+            pair_timestamps=pair_timestamps,
+            pair_timestamp_tokens=pair_timestamp_tokens,
+            min_timestamp_tokens=min_timestamp_tokens,
+        )
+
+    def _set_replay_token_position(
+        self,
+        tokens: int | list[int] | torch.Tensor,
+        position: int | list[int] | torch.Tensor,
+    ) -> None:
         if isinstance(tokens, int):
             self.static_current_token.fill_(tokens)
         elif isinstance(tokens, torch.Tensor):
@@ -490,6 +503,15 @@ class Mxfp8KvCacheCudaGraphSampler:
             if len(position) != self.decode_batch_size:
                 raise ValueError(f"expected {self.decode_batch_size} positions, got {len(position)}")
             self.static_position.copy_(torch.tensor(position, device=self.device, dtype=torch.long))
+
+    def _set_replay_control(
+        self,
+        *,
+        force_timestamps: bool | list[bool] | torch.Tensor = False,
+        pair_timestamps: bool | list[bool] | torch.Tensor = False,
+        pair_timestamp_tokens: int | list[int] | torch.Tensor | None = None,
+        min_timestamp_tokens: int | list[int] | torch.Tensor | None = None,
+    ) -> None:
         if isinstance(force_timestamps, bool):
             self.static_force_timestamp.fill_(force_timestamps)
         elif isinstance(force_timestamps, torch.Tensor):
@@ -527,6 +549,19 @@ class Mxfp8KvCacheCudaGraphSampler:
                 raise ValueError(f"expected {self.decode_batch_size} minimum timestamp tokens, got {len(min_timestamp_tokens)}")
             self.static_min_timestamp.copy_(torch.tensor(min_timestamp_tokens, device=self.device, dtype=torch.long))
 
+    def _replay_captured_graph(self, *, compute_no_speech: bool) -> None:
+        if compute_no_speech:
+            assert self.prompt_graph is not None
+            assert self.prompt_graph_next_token is not None
+            assert self.prompt_graph_selected_logprob is not None
+            assert self.prompt_graph_no_speech_prob is not None
+            self.prompt_graph.replay()
+            self.graph_next_token.copy_(self.prompt_graph_next_token)
+            self.graph_selected_logprob.copy_(self.prompt_graph_selected_logprob)
+            self.graph_no_speech_prob.copy_(self.prompt_graph_no_speech_prob)
+        else:
+            self.graph.replay()
+
     def _replay_device(
         self,
         tokens: int | list[int] | torch.Tensor,
@@ -557,17 +592,28 @@ class Mxfp8KvCacheCudaGraphSampler:
         )
         self._sampling_seed_counter = (self._sampling_seed_counter + 1) & 0x7FFFFFFF
         self.static_sampling_seed.fill_(self._sampling_seed_counter)
-        if compute_no_speech:
-            assert self.prompt_graph is not None
-            assert self.prompt_graph_next_token is not None
-            assert self.prompt_graph_selected_logprob is not None
-            assert self.prompt_graph_no_speech_prob is not None
-            self.prompt_graph.replay()
-            self.graph_next_token.copy_(self.prompt_graph_next_token)
-            self.graph_selected_logprob.copy_(self.prompt_graph_selected_logprob)
-            self.graph_no_speech_prob.copy_(self.prompt_graph_no_speech_prob)
-        else:
-            self.graph.replay()
+        self._replay_captured_graph(compute_no_speech=compute_no_speech)
+
+    def _replay_device_static_control(
+        self,
+        tokens: int | list[int] | torch.Tensor,
+        position: int | list[int] | torch.Tensor,
+        *,
+        compute_no_speech: bool = False,
+    ) -> None:
+        if self.graph is None or self.graph_next_token is None or self.graph_selected_logprob is None or self.graph_no_speech_prob is None:
+            raise RuntimeError("CUDA graph sampler has not been captured")
+        if compute_no_speech and (
+            self.prompt_graph is None
+            or self.prompt_graph_next_token is None
+            or self.prompt_graph_selected_logprob is None
+            or self.prompt_graph_no_speech_prob is None
+        ):
+            raise RuntimeError("prompt CUDA graph sampler has not been captured")
+        self._set_replay_token_position(tokens, position)
+        self._sampling_seed_counter = (self._sampling_seed_counter + 1) & 0x7FFFFFFF
+        self.static_sampling_seed.fill_(self._sampling_seed_counter)
+        self._replay_captured_graph(compute_no_speech=compute_no_speech)
 
     def _replay(
         self,
@@ -629,19 +675,21 @@ class Mxfp8KvCacheCudaGraphSampler:
         self.static_pair_timestamp_token.fill_(self.timestamp_begin)
         self.static_min_timestamp.fill_(self.timestamp_begin)
 
-        for position, token in enumerate(prompt[:prompt_len]):
-            force_initial_timestamp = self.timestamps_after_sentence_end and position == prompt_len - 1
+        for position, token in enumerate(prompt[: max(prompt_len - 1, 0)]):
+            self._replay_device_static_control(token, position)
+        if prompt_len:
+            final_position = prompt_len - 1
+            force_initial_timestamp = self.timestamps_after_sentence_end
             self._replay_device(
-                token,
-                position,
+                prompt[final_position],
+                final_position,
                 force_timestamps=force_initial_timestamp,
                 pair_timestamps=False,
                 pair_timestamp_tokens=self.timestamp_begin,
                 min_timestamp_tokens=self.timestamp_begin,
-                compute_no_speech=position == prompt_len - 1,
+                compute_no_speech=True,
             )
-            if position == prompt_len - 1:
-                self.no_speech_probs.copy_(self.graph_no_speech_prob)
+            self.no_speech_probs.copy_(self.graph_no_speech_prob)
 
         max_steps = min(max_new_tokens, self.generated_token_buffer.shape[1])
         if prompt_len > 0 and max_steps > 0:
@@ -728,14 +776,14 @@ class Mxfp8KvCacheCudaGraphSampler:
 
         prompt_tokens = torch.tensor(prompt_token_rows, device=self.device, dtype=torch.long)
         prompt_positions = torch.tensor(prompt_position_rows, device=self.device, dtype=torch.long)
+        self.static_force_timestamp.zero_()
+        self.static_pair_timestamp.zero_()
+        self.static_pair_timestamp_token.fill_(self.timestamp_begin)
+        self.static_min_timestamp.fill_(self.timestamp_begin)
         for position in range(max_nonfinal_len):
-            self._replay_device(
+            self._replay_device_static_control(
                 prompt_tokens[position],
                 prompt_positions[position],
-                force_timestamps=False,
-                pair_timestamps=False,
-                pair_timestamp_tokens=self.timestamp_begin,
-                min_timestamp_tokens=self.timestamp_begin,
             )
         return prompt_lens
 
