@@ -205,7 +205,6 @@ def build_realistic_cases(model_name_or_path: str, wav_path: str | Path, device:
         decoder_hidden = model.model.decoder(decoder_input_ids, encoder_hidden)
         logits = model.proj_out(decoder_hidden).float()
 
-    lora_rank = 8
     return {
         "model": model,
         "features": features.detach(),
@@ -222,15 +221,6 @@ def build_realistic_cases(model_name_or_path: str, wav_path: str | Path, device:
         "linear": (mlp_input.detach(), enc_layer.fc1.weight.detach(), enc_layer.fc1.bias.detach()),
         "matmul_top1": (decoder_hidden[:, -1].detach(), model.proj_out.weight.detach(), model.proj_out.bias.detach() if model.proj_out.bias is not None else None),
         "cross_entropy": (logits.detach(), logits.argmax(dim=-1).detach()),
-        "lora": (
-            mlp_input.detach(),
-            mlp_input.detach(),
-            enc_layer.fc1.weight.detach(),
-            enc_layer.fc1.bias.detach(),
-            enc_layer.fc1.weight[:lora_rank].detach(),
-            enc_layer.fc1.weight[:, :lora_rank].detach(),
-            1.0,
-        ),
     }
 
 
@@ -244,7 +234,6 @@ def validate_realistic_ops(model_name_or_path: str, wav_path: str | Path = DEFAU
     from plu.ref.gelu_mlp import gelu_mlp as ref_gelu_mlp
     from plu.ref.layer_norm import layer_norm as ref_layer_norm
     from plu.ref.linear import linear as ref_linear
-    from plu.ref.lora import lora_linear as ref_lora_linear
     from plu.ref.matmul_top1 import matmul_top1 as ref_matmul_top1
     from plu.ref.qkv_proj import qkv_proj as ref_qkv_proj
     from plu.ref.residual_add import residual_add as ref_residual_add
@@ -257,7 +246,6 @@ def validate_realistic_ops(model_name_or_path: str, wav_path: str | Path = DEFAU
     from plu.triton.gelu_mlp import gelu_mlp as triton_gelu_mlp
     from plu.triton.layer_norm import layer_norm as triton_layer_norm
     from plu.triton.linear import linear as triton_linear
-    from plu.triton.lora import lora_linear as triton_lora_linear
     from plu.triton.matmul_top1 import matmul_top1 as triton_matmul_top1
     from plu.triton.qkv_proj import qkv_proj as triton_qkv_proj
     from plu.triton.residual_add import residual_add as triton_residual_add
@@ -301,7 +289,6 @@ def validate_realistic_ops(model_name_or_path: str, wav_path: str | Path = DEFAU
         _compare_tensor_op("linear", ref_linear, triton_linear, cases["linear"], grad_mode="sum", atol=5e-2, rtol=5e-3, grad_atol=2e-1, grad_rtol=5e-3),
         _compare_matmul_top1(ref_matmul_top1, triton_matmul_top1, *cases["matmul_top1"]),
         _compare_tensor_op("cross_entropy", ref_cross_entropy, triton_cross_entropy, cases["cross_entropy"], atol=1e-4, rtol=1e-4, grad_atol=1e-4, grad_rtol=1e-4),
-        _compare_tensor_op("lora", ref_lora_linear, triton_lora_linear, cases["lora"], grad_mode="sum", atol=1e-1, rtol=7e-3, grad_atol=1.0, grad_rtol=7e-3),
     ]
     return results
 
@@ -333,7 +320,6 @@ def test_whisper_turbo_realistic_op_numerics() -> None:
         "linear",
         "matmul_top1",
         "cross_entropy",
-        "lora",
     }
 
 

@@ -9,7 +9,6 @@ import torch
 from plu.ref.cross_entropy import cross_entropy as ref_cross_entropy
 from plu.ref.flash_attention import flash_attention as ref_flash_attention
 from plu.ref.gelu_mlp import gelu_mlp as ref_gelu_mlp
-from plu.ref.lora import lora_linear as ref_lora_linear
 from plu.ref.matmul_top1 import matmul_top1 as ref_matmul_top1
 from plu.ref.paged_kv_cache import make_static_page_table as ref_make_static_page_table
 from plu.ref.paged_kv_cache import paged_self_kv_cache_attention as ref_paged_self_kv_cache_attention
@@ -26,7 +25,6 @@ from plu.ref.residual_add import residual_add as ref_residual_add
 from plu.triton.cross_entropy import cross_entropy as triton_cross_entropy
 from plu.triton.flash_attention import flash_attention as triton_flash_attention
 from plu.triton.gelu_mlp import gelu_mlp as triton_gelu_mlp
-from plu.triton.lora import lora_linear as triton_lora_linear
 from plu.triton.matmul_top1 import matmul_top1 as triton_matmul_top1
 from plu.triton.c_proj import c_proj as triton_c_proj
 from plu.triton.conv1d_gelu import conv1d_gelu as triton_conv1d_gelu
@@ -308,28 +306,6 @@ def bench_gelu_mlp(args: argparse.Namespace) -> list[dict]:
     ]
 
 
-def bench_lora(args: argparse.Namespace) -> list[dict]:
-    x = torch.randn(args.rows, args.hidden, device="cuda", requires_grad=True)
-    adapter_input = torch.randn(args.rows, args.hidden, device="cuda", requires_grad=True)
-    base_weight = torch.randn(args.hidden, args.hidden, device="cuda", requires_grad=True)
-    base_bias = torch.randn(args.hidden, device="cuda", requires_grad=True)
-    lora_a = torch.randn(args.rank, args.hidden, device="cuda", requires_grad=True)
-    lora_b = torch.randn(args.hidden, args.rank, device="cuda", requires_grad=True)
-
-    def ref_step():
-        xs = [fresh_like(t) for t in (x, adapter_input, base_weight, base_bias, lora_a, lora_b)]
-        ref_lora_linear(*xs, args.lora_scaling).sum().backward()
-
-    def triton_step():
-        xs = [fresh_like(t) for t in (x, adapter_input, base_weight, base_bias, lora_a, lora_b)]
-        triton_lora_linear(*xs, args.lora_scaling).sum().backward()
-
-    return [
-        {"op": "lora", "target": "ref", "mode": "forward_backward", "ms": cuda_time_ms(ref_step, args.warmup, args.iters)},
-        {"op": "lora", "target": "triton", "mode": "forward_backward", "ms": cuda_time_ms(triton_step, args.warmup, args.iters)},
-    ]
-
-
 def bench_linear(args: argparse.Namespace) -> list[dict]:
     x = torch.randn(args.rows, args.hidden, device="cuda", requires_grad=True)
     weight = torch.randn(args.linear_out, args.hidden, device="cuda", requires_grad=True)
@@ -568,7 +544,6 @@ def parse_args() -> argparse.Namespace:
             "unembedding_cross_entropy",
             "matmul_top1",
             "gelu_mlp",
-            "lora",
             "linear",
             "mx_linear",
             "conv1d_gelu",
@@ -592,8 +567,6 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--hidden", type=int, default=1280)
     parser.add_argument("--ffn", type=int, default=5120)
     parser.add_argument("--vocab", type=int, default=51865)
-    parser.add_argument("--rank", type=int, default=8)
-    parser.add_argument("--lora-scaling", type=float, default=4.0)
     parser.add_argument("--mel-bins", type=int, default=128)
     parser.add_argument("--input-frames", type=int, default=None, help="Input frame count for convolution benchmarks. Defaults to query_len * 2.")
     parser.add_argument("--target-len", type=int, default=448)
@@ -621,7 +594,6 @@ def main() -> None:
         "unembedding_cross_entropy": bench_unembedding_cross_entropy,
         "matmul_top1": bench_matmul_top1,
         "gelu_mlp": bench_gelu_mlp,
-        "lora": bench_lora,
         "linear": bench_linear,
         "mx_linear": bench_mx_linear,
         "conv1d_gelu": bench_conv1d_gelu,
