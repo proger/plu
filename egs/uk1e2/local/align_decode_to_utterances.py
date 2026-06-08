@@ -294,8 +294,9 @@ def load_refs(path: Path) -> dict[str, list[dict[str, Any]]]:
                     "recording_id": recording_id,
                     "start": start,
                     "end": end,
-                    "text": clean_text(str(row.get("normalized_text") or row.get("text") or "")),
+                    "text": clean_text(str(row.get("text") or row.get("normalized_text") or "")),
                     "raw_text": clean_text(str(row.get("text") or "")),
+                    "normalized_text": clean_text(str(row.get("normalized_text") or "")),
                     "speaker_id": row.get("speaker_id"),
                     "utterance_id": row.get("utterance_id"),
                     "domain": row.get("domain"),
@@ -383,6 +384,7 @@ def reference_view(ref: dict[str, Any], overlap: float, gap: float | None = None
         "overlap_seconds": round(overlap, 2),
         "text": ref.get("text") or "",
         "raw_text": ref.get("raw_text") or "",
+        "normalized_text": ref.get("normalized_text") or "",
         "speaker_id": ref.get("speaker_id"),
         "utterance_id": ref.get("utterance_id"),
         "domain": ref.get("domain"),
@@ -429,6 +431,9 @@ def align_row(
     primary = max(reference_rows, key=lambda item: item["overlap_seconds"], default=None)
     reference_text = clean_text(" ".join(ref["text"] for ref in reference_rows if ref.get("text")))
     reference_raw_text = clean_text(" ".join(ref["raw_text"] for ref in reference_rows if ref.get("raw_text")))
+    reference_normalized_text = clean_text(
+        " ".join(ref["normalized_text"] for ref in reference_rows if ref.get("normalized_text"))
+    )
     total_overlap = sum(ref["overlap_seconds"] for ref in reference_rows)
     hyp_text = clean_text(str(row.get("text_no_timestamps") or strip_timestamps(str(row.get("text") or ""))))
     reference_counterpart, counterpart_method, counterpart_metadata = counterpart_from_refs(
@@ -438,13 +443,14 @@ def align_row(
         speech_end,
         "text",
     )
-    reference_raw_counterpart, _, _ = counterpart_from_refs(
+    reference_normalized_counterpart, _, _ = counterpart_from_refs(
         hyp_text,
         reference_rows,
         speech_start,
         speech_end,
-        "raw_text",
+        "normalized_text",
     )
+    reference_raw_counterpart = reference_counterpart
 
     return {
         "decode_id": row.get("id"),
@@ -468,9 +474,11 @@ def align_row(
         "reference_counterpart": reference_counterpart,
         "reference_counterpart_method": counterpart_method,
         "reference_counterpart_metadata": counterpart_metadata,
+        "reference_normalized_text": reference_normalized_text,
+        "reference_normalized_counterpart": reference_normalized_counterpart,
         "reference_raw_text": reference_raw_text,
         "reference_raw_counterpart": reference_raw_counterpart,
-        "reference_source_field": "normalized_text",
+        "reference_source_field": "text",
         "reference_ids": [ref["id"] for ref in reference_rows],
         "primary_reference_id": primary["id"] if primary else None,
         "match_kind": match_kind,

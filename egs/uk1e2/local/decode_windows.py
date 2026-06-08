@@ -53,6 +53,12 @@ def parse_args() -> argparse.Namespace:
         help="Advance each 30s window by one discovered sentence-end timestamp instead of a fixed hop.",
     )
     parser.add_argument(
+        "--sentence-hop-mode",
+        choices=["first", "last"],
+        default="first",
+        help="With --sentence-hop, advance to the first or last complete decoded sentence timestamp.",
+    )
+    parser.add_argument(
         "--condition-on-previous-utterance",
         action="store_true",
         help="Prefix each decode with the previous utterance text using Whisper's <|startofprev|> prompt format.",
@@ -163,7 +169,7 @@ def completed_context_rows(path: Path) -> dict[str, dict[str, object]]:
             utt_id = row.get("utt_id")
             if not utt_id:
                 continue
-            if row.get("smc_selected"):
+            if row.get("sample_selected") or row.get("smc_selected"):
                 selected_rows[str(utt_id)] = row
             elif int(row.get("alternative", 0)) == 0:
                 fallback_rows[str(utt_id)] = row
@@ -212,6 +218,57 @@ def sentence_end_timestamps(tokenizer, generated: list[int], time_precision: flo
     return timestamps
 
 
+def sentence_segments(tokenizer, generated: list[int], logprobs: list[float], time_precision: float) -> list[dict[str, object]]:
+    segments: list[dict[str, object]] = []
+    special_ids = set(tokenizer.special_tokens.values()) | {tokenizer.pad_token_id}
+    current_start_offset = 0.0
+    current_start_token = tokenizer.timestamp_begin
+    current_tokens: list[int] = []
+    current_logprobs: list[float] = []
+    current_token_start: int | None = None
+    pending_sentence_end = False
+
+    for token_index, token in enumerate(generated):
+        if token >= tokenizer.timestamp_begin:
+            offset = round((token - tokenizer.timestamp_begin) * time_precision, 2)
+            if current_tokens:
+                text = tokenizer.decode(current_tokens).strip()
+                avg_logprob = sum(current_logprobs) / len(current_logprobs) if current_logprobs else 0.0
+                segments.append(
+                    {
+                        "index": len(segments),
+                        "start": round(current_start_offset, 2),
+                        "end": offset,
+                        "start_token": current_start_token,
+                        "end_token": token,
+                        "text": text,
+                        "text_token_ids": current_tokens,
+                        "token_start": current_token_start,
+                        "token_end": token_index,
+                        "avg_logprob": round(avg_logprob, 6),
+                        "complete_sentence": pending_sentence_end,
+                    }
+                )
+                current_tokens = []
+                current_logprobs = []
+                current_token_start = None
+                pending_sentence_end = False
+            current_start_offset = offset
+            current_start_token = token
+            continue
+        if token in special_ids:
+            pending_sentence_end = False
+            continue
+        if not current_tokens:
+            current_token_start = token_index
+        current_tokens.append(token)
+        if token_index < len(logprobs):
+            current_logprobs.append(float(logprobs[token_index]))
+        pending_sentence_end = token_ends_sentence(tokenizer, token)
+
+    return segments
+
+
 def max_ngram_count(tokens: list[int], n: int) -> int:
     if len(tokens) < n:
         return 0
@@ -230,7 +287,7 @@ def text_tokens_since_last_timestamp(tokenizer, generated: list[int]) -> int:
     return count
 
 
-def smc_particle_quality(tokenizer, generated: list[int], text_tokens: list[int], logprobs: list[float], no_speech_prob: float) -> dict[str, object]:
+def sample_particle_quality(tokenizer, generated: list[int], text_tokens: list[int], logprobs: list[float], no_speech_prob: float) -> dict[str, object]:
     avg_logprob = sum(logprobs) / len(logprobs) if logprobs else 0.0
     repeated_2gram_max = max_ngram_count(text_tokens, 2)
     repeated_3gram_max = max_ngram_count(text_tokens, 3)
@@ -267,10 +324,10 @@ def smc_particle_quality(tokenizer, generated: list[int], text_tokens: list[int]
 
     return {
         "avg_logprob_raw": avg_logprob,
-        "smc_score": avg_logprob - penalty,
-        "smc_penalty": penalty,
-        "smc_accepted": not reject_reasons,
-        "smc_reject_reasons": reject_reasons,
+        "sample_score": avg_logprob - penalty,
+        "sample_penalty": penalty,
+        "sample_accepted": not reject_reasons,
+        "sample_reject_reasons": reject_reasons,
         "repeated_2gram_max": repeated_2gram_max,
         "repeated_3gram_max": repeated_3gram_max,
         "repeated_4gram_max": repeated_4gram_max,
@@ -279,10 +336,10 @@ def smc_particle_quality(tokenizer, generated: list[int], text_tokens: list[int]
     }
 
 
-def select_smc_particle(qualities: list[dict[str, object]]) -> int:
-    accepted = [index for index, quality in enumerate(qualities) if quality["smc_accepted"]]
+def select_sample(qualities: list[dict[str, object]]) -> int:
+    accepted = [index for index, quality in enumerate(qualities) if quality["sample_accepted"]]
     candidates = accepted if accepted else list(range(len(qualities)))
-    return max(candidates, key=lambda index: float(qualities[index]["smc_score"]))
+    return max(candidates, key=lambda index: float(qualities[index]["sample_score"]))
 
 
 @torch.no_grad()
@@ -329,7 +386,7 @@ def main() -> None:
     min_window_samples = round(args.min_window_seconds * SAMPLE_RATE)
     time_precision = 30.0 / model.config.max_source_positions
     max_previous_tokens = model.config.max_target_positions // 2 - 1
-    sample_first_sentence_only = args.sentence_hop and args.decode_batch_size > 1
+    sample_first_sentence_only = args.sentence_hop and args.sentence_hop_mode == "first" and args.decode_batch_size > 1
     start_time = time.perf_counter()
 
     meta_json.write_text(
@@ -347,11 +404,12 @@ def main() -> None:
                 "max_new_tokens": args.max_new_tokens,
                 "timestamps_after_sentence_end": args.timestamps_after_sentence_end,
                 "sentence_hop": args.sentence_hop,
+                "sentence_hop_mode": args.sentence_hop_mode,
                 "condition_on_previous_utterance": args.condition_on_previous_utterance,
-                "decode_strategy": "greedy" if args.decode_batch_size == 1 else "smc_best_particle",
+                "decode_strategy": "greedy" if args.decode_batch_size == 1 else "sample_best",
                 "sample_first_sentence_only": sample_first_sentence_only,
-                "sampler_smc_page_size": getattr(sampler, "smc_page_size", None),
-                "smc_quality": {
+                "sampler_sample_page_size": getattr(sampler, "sample_page_size", getattr(sampler, "smc_page_size", None)),
+                "sample_quality": {
                     "repeated_2gram_max_reject": 32,
                     "repeated_3gram_max_reject": 10,
                     "repeated_4gram_max_reject": 8,
@@ -440,8 +498,11 @@ def main() -> None:
                         sample_sentence_timestamps = (
                             sentence_end_timestamps(tokenizer, generated, time_precision) if args.timestamps_after_sentence_end else []
                         )
+                        sample_sentence_segments = (
+                            sentence_segments(tokenizer, generated, logprobs, time_precision) if args.timestamps_after_sentence_end else []
+                        )
                         total_generated_tokens += len(logprobs)
-                        quality = smc_particle_quality(tokenizer, generated, sample_text_token_ids, logprobs, no_speech_prob)
+                        quality = sample_particle_quality(tokenizer, generated, sample_text_token_ids, logprobs, no_speech_prob)
                         token_logprobs = [round(float(logprob), 6) for logprob in logprobs]
                         sample_records.append(
                             {
@@ -455,29 +516,33 @@ def main() -> None:
                                 "text_no_timestamps": text_no_timestamps,
                                 "text": text,
                                 "sentence_end_timestamps": sample_sentence_timestamps,
+                                "sentence_segments": sample_sentence_segments,
                                 "quality": quality,
                             }
                         )
 
-                    selected_alternative = select_smc_particle([record["quality"] for record in sample_records])
+                    selected_alternative = select_sample([record["quality"] for record in sample_records])
                     selected_record = sample_records[selected_alternative]
                     selected_quality = selected_record["quality"]
-                    selected_accepted = bool(selected_quality["smc_accepted"])
+                    selected_accepted = bool(selected_quality["sample_accepted"])
                     next_previous_text_tokens = selected_record["text_token_ids"] if selected_accepted else []
                     if args.sentence_hop:
                         next_start_sample = min(end_sample, audio.numel())
-                        hop_source = "window_end" if selected_accepted else "smc_rejected_window_end"
+                        hop_source = "window_end" if selected_accepted else "sample_rejected_window_end"
                         if selected_accepted:
-                            for timestamp in selected_record["sentence_end_timestamps"]:
+                            timestamps = list(selected_record["sentence_end_timestamps"])
+                            if args.sentence_hop_mode == "last":
+                                timestamps = list(reversed(timestamps))
+                            for timestamp in timestamps:
                                 candidate = start_sample + round(float(timestamp["offset"]) * SAMPLE_RATE)
                                 if start_sample < candidate <= end_sample:
                                     next_start_sample = candidate
-                                    hop_source = "sentence_timestamp"
+                                    hop_source = f"{args.sentence_hop_mode}_sentence_timestamp"
                                     break
 
                     ranked_alternatives = sorted(
                         range(len(sample_records)),
-                        key=lambda index: float(sample_records[index]["quality"]["smc_score"]),
+                        key=lambda index: float(sample_records[index]["quality"]["sample_score"]),
                         reverse=True,
                     )
                     rank_by_alternative = {alternative: rank + 1 for rank, alternative in enumerate(ranked_alternatives)}
@@ -500,16 +565,16 @@ def main() -> None:
                             "conf": None,
                             "avg_logprob": round(float(quality["avg_logprob_raw"]), 3),
                             "cumulative_logprob": round(sum(logprobs), 6),
-                            "decode_strategy": "greedy" if alternative == 0 else "smc_sample",
-                            "smc_selected": alternative == selected_alternative,
-                            "smc_selected_for_context": alternative == selected_alternative and selected_accepted,
-                            "smc_selected_alternative": selected_alternative,
-                            "smc_rank": rank_by_alternative[alternative],
-                            "smc_score": round(float(quality["smc_score"]), 6),
+                            "decode_strategy": "greedy" if alternative == 0 else "sample",
+                            "sample_selected": alternative == selected_alternative,
+                            "sample_selected_for_context": alternative == selected_alternative and selected_accepted,
+                            "sample_selected_alternative": selected_alternative,
+                            "sample_rank": rank_by_alternative[alternative],
+                            "sample_score": round(float(quality["sample_score"]), 6),
                             "sampler_page_resample_count": getattr(sampler, "last_page_resample_count", 0),
-                            "smc_penalty": round(float(quality["smc_penalty"]), 6),
-                            "smc_accepted": bool(quality["smc_accepted"]),
-                            "smc_reject_reasons": quality["smc_reject_reasons"],
+                            "sample_penalty": round(float(quality["sample_penalty"]), 6),
+                            "sample_accepted": bool(quality["sample_accepted"]),
+                            "sample_reject_reasons": quality["sample_reject_reasons"],
                             "repeated_2gram_max": quality["repeated_2gram_max"],
                             "repeated_3gram_max": quality["repeated_3gram_max"],
                             "repeated_4gram_max": quality["repeated_4gram_max"],
@@ -534,6 +599,14 @@ def main() -> None:
                             row["text_no_timestamps"] = record["text_no_timestamps"]
                             row["timestamp_ids"] = [token for token in record["generated"] if token >= tokenizer.timestamp_begin]
                             row["sentence_end_timestamps"] = record["sentence_end_timestamps"]
+                            row["sentence_segments"] = [
+                                {
+                                    **segment_row,
+                                    "absolute_start": round(start_seconds + float(segment_row["start"]), 2),
+                                    "absolute_end": round(start_seconds + float(segment_row["end"]), 2),
+                                }
+                                for segment_row in record["sentence_segments"]
+                            ]
                         decode_f.write(json.dumps(row, ensure_ascii=False) + "\n")
                     decode_f.flush()
                     if args.condition_on_previous_utterance and next_previous_text_tokens is not None:
