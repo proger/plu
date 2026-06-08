@@ -128,7 +128,7 @@ def batched_log_mel_spectrogram(
 
 
 def encode_window_features(model, packed: dict[int, object], features: torch.Tensor) -> torch.Tensor:
-    encoder_batch_size = min(features.shape[0], 4)
+    encoder_batch_size = 1
     if features.shape[0] <= encoder_batch_size:
         return plu_test.encode_packed_mxfp8(model, packed, features)
     chunks = [
@@ -270,7 +270,7 @@ def main() -> None:
                 "audio_load_workers": args.audio_load_workers,
                 "sampler_decode_batch_size": args.decode_batch_size * args.window_batch_size,
                 "sampler_cross_cache_batch_size": args.window_batch_size,
-                "encoder_window_batch_size": min(args.window_batch_size, 4),
+                "encoder_window_batch_size": 1,
                 "compact_prompt_prefill": True,
                 "max_new_tokens": args.max_new_tokens,
                 "timestamps_after_sentence_end": args.timestamps_after_sentence_end,
