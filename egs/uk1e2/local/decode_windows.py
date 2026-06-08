@@ -4,7 +4,6 @@ from __future__ import annotations
 import argparse
 import io
 import json
-import os
 import shlex
 import subprocess
 import sys
@@ -134,10 +133,6 @@ def window_command(media_path: str, start_seconds: float, duration_seconds: floa
         f"ffmpeg -nostdin -ss {start_seconds:.2f} -t {duration_seconds:.2f} -i {quoted} "
         "-f wav -acodec pcm_s16le -ar 16000 -ac 1 - |"
     )
-
-
-def completed_utterances(path: Path, batch_size: int) -> set[str]:
-    return set(completed_window_info(path, batch_size))
 
 
 def completed_window_info(path: Path, batch_size: int) -> dict[str, float | None]:
@@ -426,7 +421,6 @@ def main() -> None:
                 "condition_on_previous_utterance": args.condition_on_previous_utterance,
                 "decode_strategy": "greedy" if args.decode_batch_size == 1 else "sample_best",
                 "sample_first_sentence_only": sample_first_sentence_only,
-                "sampler_sample_page_size": getattr(sampler, "sample_page_size", getattr(sampler, "smc_page_size", None)),
                 "sample_quality": {
                     "repeated_2gram_max_reject": 32,
                     "repeated_3gram_max_reject": 10,
@@ -604,7 +598,6 @@ def main() -> None:
                             "sample_selected_alternative": selected_alternative,
                             "sample_rank": rank_by_alternative[alternative],
                             "sample_score": round(float(quality["sample_score"]), 6),
-                            "sampler_page_resample_count": getattr(sampler, "last_page_resample_count", 0),
                             "sample_penalty": round(float(quality["sample_penalty"]), 6),
                             "sample_accepted": bool(quality["sample_accepted"]),
                             "sample_reject_reasons": quality["sample_reject_reasons"],

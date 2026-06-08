@@ -60,12 +60,6 @@ def parse_args() -> argparse.Namespace:
     return parser.parse_args()
 
 
-def token_ends_sentence(tokenizer, token: int) -> bool:
-    if token >= tokenizer.timestamp_begin or token == tokenizer.eot:
-        return False
-    return tokenizer.decode([token]).rstrip().endswith((".", "!", "?"))
-
-
 def make_state(file_index: int, recording_id: str, source: str) -> dict[str, object]:
     audio = load_scp_audio(source).flatten().float()
     return {
@@ -518,7 +512,6 @@ def main() -> None:
                         "sample_selected_alternative": selected_alternative,
                         "sample_rank": rank_by_alternative[alternative],
                         "sample_score": round(float(quality["sample_score"]), 6),
-                        "sampler_page_resample_count": getattr(sampler, "last_page_resample_count", 0),
                         "sample_penalty": round(float(quality["sample_penalty"]), 6),
                         "sample_accepted": bool(quality["sample_accepted"]),
                         "sample_reject_reasons": quality["sample_reject_reasons"],
