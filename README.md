@@ -1,6 +1,4 @@
-# plu: audio-conditional language models are multi-task recognizers
-
-.. and they need some tooling
+# plu: fast finetuning for whisper
 
 [![PyPI](https://img.shields.io/pypi/v/plu.svg)](https://pypi.org/project/plu/)
 [![Changelog](https://img.shields.io/github/v/release/proger/plu?include_prereleases&label=changelog)](https://github.com/proger/plu/releases)
@@ -9,22 +7,7 @@
 
 ## Installation
 
-Install this tool using `pip`:
-```bash
-pip install plu
-```
-
-## Development
-
-To contribute to this tool, first checkout the code. Then create a new virtual environment:
-
-```bash
-cd wtok
-python -m venv venv
-source venv/bin/activate
-```
-
-Now install for editing:
+Download the code and install locally:
 
 ```bash
 pip install -e .
