@@ -106,6 +106,8 @@ def load_scp_audio(source: str) -> torch.Tensor:
     argv = command_argv(source)
     if argv is None:
         return load_audio(source)
+    if Path(argv[0]).name == "ffmpeg" and "-nostdin" not in argv:
+        argv = [argv[0], "-nostdin", *argv[1:]]
     process = subprocess.run(argv, check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
     return decode_wav_bytes(process.stdout)
 
@@ -187,21 +189,37 @@ def suppress_tokens(tokenizer, eos_token_id: int, *, allow_timestamps: bool) -> 
     return tokens
 
 
+def tokenizer_special_ids(tokenizer) -> set[int]:
+    cached = getattr(tokenizer, "_plu_special_ids", None)
+    if cached is None:
+        cached = set(tokenizer.special_tokens.values()) | {tokenizer.pad_token_id}
+        setattr(tokenizer, "_plu_special_ids", cached)
+    return cached
+
+
 def decode_timestamped_text(tokenizer, generated: list[int]) -> str:
-    special_ids = set(tokenizer.special_tokens.values()) | {tokenizer.pad_token_id}
+    special_ids = tokenizer_special_ids(tokenizer)
     token_ids = [token for token in generated if token >= tokenizer.timestamp_begin or token not in special_ids]
     return tokenizer.decode_with_timestamps(token_ids).strip()
 
 
 def text_token_ids(tokenizer, generated: list[int]) -> list[int]:
-    special_ids = set(tokenizer.special_tokens.values()) | {tokenizer.pad_token_id}
+    special_ids = tokenizer_special_ids(tokenizer)
     return [token for token in generated if token < tokenizer.timestamp_begin and token not in special_ids]
 
 
 def token_ends_sentence(tokenizer, token: int) -> bool:
     if token >= tokenizer.timestamp_begin or token == tokenizer.eot:
         return False
-    return tokenizer.decode([token]).rstrip().endswith((".", "!", "?"))
+    cache = getattr(tokenizer, "_plu_sentence_end_cache", None)
+    if cache is None:
+        cache = {}
+        setattr(tokenizer, "_plu_sentence_end_cache", cache)
+    cached = cache.get(token)
+    if cached is None:
+        cached = tokenizer.decode([token]).rstrip().endswith((".", "!", "?"))
+        cache[token] = cached
+    return cached
 
 
 def sentence_end_timestamps(tokenizer, generated: list[int], time_precision: float) -> list[dict[str, float | int]]:
@@ -220,7 +238,7 @@ def sentence_end_timestamps(tokenizer, generated: list[int], time_precision: flo
 
 def sentence_segments(tokenizer, generated: list[int], logprobs: list[float], time_precision: float) -> list[dict[str, object]]:
     segments: list[dict[str, object]] = []
-    special_ids = set(tokenizer.special_tokens.values()) | {tokenizer.pad_token_id}
+    special_ids = tokenizer_special_ids(tokenizer)
     current_start_offset = 0.0
     current_start_token = tokenizer.timestamp_begin
     current_tokens: list[int] = []
@@ -277,7 +295,7 @@ def max_ngram_count(tokens: list[int], n: int) -> int:
 
 
 def text_tokens_since_last_timestamp(tokenizer, generated: list[int]) -> int:
-    special_ids = set(tokenizer.special_tokens.values()) | {tokenizer.pad_token_id}
+    special_ids = tokenizer_special_ids(tokenizer)
     count = 0
     for token in generated:
         if token >= tokenizer.timestamp_begin:
@@ -436,11 +454,19 @@ def main() -> None:
         decoded_windows = 0
         total_audio_seconds = 0.0
         total_decode_seconds = 0.0
+        total_audio_load_seconds = 0.0
+        total_mel_seconds = 0.0
+        total_encoder_seconds = 0.0
+        total_sample_seconds = 0.0
+        total_postprocess_seconds = 0.0
         total_generated_tokens = 0
+        last_flushed_decoded_windows = 0
 
         for file_index, (recording_id, source) in enumerate(rows):
             media_path = source_media_path(source)
+            audio_load_start = time.perf_counter()
             audio = load_scp_audio(source).flatten().float()
+            total_audio_load_seconds += time.perf_counter() - audio_load_start
             duration = audio.numel() / SAMPLE_RATE
             total_audio_seconds += duration
             window_index = 0
@@ -474,10 +500,15 @@ def main() -> None:
 
                 if utt_id not in completed:
                     segment = audio[start_sample:end_sample]
+                    mel_start = time.perf_counter()
                     features = log_mel_spectrogram(segment, model.config.num_mel_bins).unsqueeze(0).to(device=device, dtype=dtype)
+                    torch.cuda.synchronize()
+                    total_mel_seconds += time.perf_counter() - mel_start
+                    encoder_start = time.perf_counter()
                     encoder_hidden_states = plu_test.encode_packed_mxfp8(model, packed, features)
                     torch.cuda.synchronize()
-                    decode_start = time.perf_counter()
+                    total_encoder_seconds += time.perf_counter() - encoder_start
+                    sample_start = time.perf_counter()
                     samples = sampler.sample_many(
                         encoder_hidden_states,
                         args.max_new_tokens,
@@ -485,9 +516,11 @@ def main() -> None:
                         stop_after_first_sentence=sample_first_sentence_only,
                     )
                     torch.cuda.synchronize()
-                    decode_seconds = time.perf_counter() - decode_start
+                    decode_seconds = time.perf_counter() - sample_start
                     total_decode_seconds += decode_seconds
+                    total_sample_seconds += decode_seconds
                     decoded_windows += 1
+                    postprocess_start = time.perf_counter()
                     sample_records: list[dict[str, object]] = []
 
                     for alternative, (token_ids, logprobs, no_speech_prob) in enumerate(samples):
@@ -608,9 +641,12 @@ def main() -> None:
                                 for segment_row in record["sentence_segments"]
                             ]
                         decode_f.write(json.dumps(row, ensure_ascii=False) + "\n")
-                    decode_f.flush()
+                    if decoded_windows - last_flushed_decoded_windows >= 128:
+                        decode_f.flush()
+                        last_flushed_decoded_windows = decoded_windows
                     if args.condition_on_previous_utterance and next_previous_text_tokens is not None:
                         previous_text_tokens = next_previous_text_tokens
+                    total_postprocess_seconds += time.perf_counter() - postprocess_start
                 elif args.sentence_hop:
                     saved_next_start = completed_info.get(utt_id)
                     if saved_next_start is None:
@@ -641,6 +677,9 @@ def main() -> None:
                 start_sample += hop_samples
 
             elapsed = time.perf_counter() - start_time
+            if decoded_windows != last_flushed_decoded_windows:
+                decode_f.flush()
+                last_flushed_decoded_windows = decoded_windows
             print(
                 json.dumps(
                     {
@@ -650,23 +689,48 @@ def main() -> None:
                         "total_windows": total_windows,
                         "decoded_windows": decoded_windows,
                         "elapsed_seconds": round(elapsed, 2),
+                        "stage_seconds": {
+                            "audio_load": round(total_audio_load_seconds, 3),
+                            "mel": round(total_mel_seconds, 3),
+                            "encoder": round(total_encoder_seconds, 3),
+                            "sample": round(total_sample_seconds, 3),
+                            "postprocess": round(total_postprocess_seconds, 3),
+                        },
                     },
                     ensure_ascii=False,
                 ),
                 flush=True,
             )
 
+    elapsed_seconds = time.perf_counter() - start_time
+    total_model_seconds = total_mel_seconds + total_encoder_seconds + total_sample_seconds
     summary = {
         "recordings": len(rows),
         "windows": total_windows,
         "decoded_windows": decoded_windows,
         "output_rows": decoded_windows * args.decode_batch_size,
         "total_audio_seconds": total_audio_seconds,
+        "total_audio_load_seconds": total_audio_load_seconds,
+        "total_mel_seconds": total_mel_seconds,
+        "total_encoder_seconds": total_encoder_seconds,
+        "total_sample_seconds": total_sample_seconds,
+        "total_postprocess_seconds": total_postprocess_seconds,
+        "total_model_seconds": total_model_seconds,
         "total_decode_seconds": total_decode_seconds,
         "wall_decode_rtf": total_decode_seconds / total_audio_seconds if total_audio_seconds else 0.0,
+        "wall_model_rtf": total_model_seconds / total_audio_seconds if total_audio_seconds else 0.0,
         "effective_decode_rtf": total_decode_seconds / (total_audio_seconds * args.decode_batch_size) if total_audio_seconds else 0.0,
+        "effective_model_rtf": total_model_seconds / (total_audio_seconds * args.decode_batch_size) if total_audio_seconds else 0.0,
         "tokens_per_second": total_generated_tokens / total_decode_seconds if total_decode_seconds else 0.0,
-        "elapsed_seconds": time.perf_counter() - start_time,
+        "elapsed_seconds": elapsed_seconds,
+        "elapsed_rtf": elapsed_seconds / total_audio_seconds if total_audio_seconds else 0.0,
+        "stage_seconds": {
+            "audio_load": total_audio_load_seconds,
+            "mel": total_mel_seconds,
+            "encoder": total_encoder_seconds,
+            "sample": total_sample_seconds,
+            "postprocess": total_postprocess_seconds,
+        },
     }
     (args.out_dir / "summary.json").write_text(json.dumps(summary, indent=2, sort_keys=True) + "\n", encoding="utf-8")
     print(json.dumps(summary, indent=2, sort_keys=True), flush=True)
