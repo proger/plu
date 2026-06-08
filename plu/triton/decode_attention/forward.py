@@ -41,30 +41,31 @@ def _self_kv_cache_attention_kernel(
     offs_n = tl.arange(0, block_n)
 
     for start in tl.range(0, max_len, block_n):
-        n = start + offs_n
-        valid_n = n <= pos
-        cached_key = tl.load(
-            key_cache_ptr + cache_base + n[:, None] * head_dim + offs_d[None, :],
-            mask=valid_n[:, None] & dim_mask[None, :],
-            other=0.0,
-        ).to(tl.float32)
-        scores = tl.sum(cached_key * query[None, :], axis=1) * scale
-        scores = tl.where(valid_n, scores, -float("inf"))
+        if start <= pos:
+            n = start + offs_n
+            valid_n = n <= pos
+            cached_key = tl.load(
+                key_cache_ptr + cache_base + n[:, None] * head_dim + offs_d[None, :],
+                mask=valid_n[:, None] & dim_mask[None, :],
+                other=0.0,
+            ).to(tl.float32)
+            scores = tl.sum(cached_key * query[None, :], axis=1) * scale
+            scores = tl.where(valid_n, scores, -float("inf"))
 
-        block_max = tl.max(scores, axis=0)
-        new_row_max = tl.maximum(row_max, block_max)
-        alpha = tl.exp(row_max - new_row_max)
-        probs = tl.exp(scores - new_row_max)
-        probs = tl.where(valid_n, probs, 0.0)
+            block_max = tl.max(scores, axis=0)
+            new_row_max = tl.maximum(row_max, block_max)
+            alpha = tl.exp(row_max - new_row_max)
+            probs = tl.exp(scores - new_row_max)
+            probs = tl.where(valid_n, probs, 0.0)
 
-        cached_value = tl.load(
-            value_cache_ptr + cache_base + n[:, None] * head_dim + offs_d[None, :],
-            mask=valid_n[:, None] & dim_mask[None, :],
-            other=0.0,
-        ).to(tl.float32)
-        acc = acc * alpha + tl.sum(probs[:, None] * cached_value, axis=0)
-        row_sum = row_sum * alpha + tl.sum(probs, axis=0)
-        row_max = new_row_max
+            cached_value = tl.load(
+                value_cache_ptr + cache_base + n[:, None] * head_dim + offs_d[None, :],
+                mask=valid_n[:, None] & dim_mask[None, :],
+                other=0.0,
+            ).to(tl.float32)
+            acc = acc * alpha + tl.sum(probs[:, None] * cached_value, axis=0)
+            row_sum = row_sum * alpha + tl.sum(probs, axis=0)
+            row_max = new_row_max
 
     out = acc / row_sum
     tl.store(out_ptr + query_base + offs_d, out, mask=dim_mask)
