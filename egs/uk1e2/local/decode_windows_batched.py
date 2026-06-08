@@ -162,6 +162,23 @@ def encode_window_features(model, packed: dict[int, object], features: torch.Ten
     return torch.cat(chunks, dim=0)
 
 
+def static_window_batch_sizes(max_size: int) -> list[int]:
+    sizes: list[int] = []
+    size = 1
+    while size < max_size:
+        sizes.append(size)
+        size *= 2
+    sizes.append(max_size)
+    return sizes
+
+
+def select_static_window_batch_size(real_size: int, sizes: list[int]) -> int:
+    for size in sizes:
+        if real_size <= size:
+            return size
+    return sizes[-1]
+
+
 def build_sample_records(tokenizer, samples, prompt_len: int, time_precision: float, timestamps: bool) -> tuple[list[dict[str, object]], int]:
     records: list[dict[str, object]] = []
     generated_token_count = 0
@@ -240,28 +257,32 @@ def main() -> None:
     packed, stats = pack_mx_model(model, "mxfp8")
     base_prompt = plu_test.prompt_ids(tokenizer, args.language, without_timestamps=not args.timestamps_after_sentence_end)
     suppress = suppress_tokens(tokenizer, model.config.eos_token_id, allow_timestamps=args.timestamps_after_sentence_end)
-    sampler = plu_test.Mxfp8KvCacheCudaGraphSampler(
-        model,
-        tokenizer,
-        packed,
-        base_prompt,
-        suppress,
-        decode_batch_size=args.decode_batch_size * args.window_batch_size,
-        timestamps_after_sentence_end=args.timestamps_after_sentence_end,
-        cross_cache_batch_size=args.window_batch_size,
-    )
-    prefill_sampler = plu_test.Mxfp8KvCacheCudaGraphSampler(
-        model,
-        tokenizer,
-        packed,
-        base_prompt,
-        suppress,
-        decode_batch_size=args.window_batch_size,
-        timestamps_after_sentence_end=args.timestamps_after_sentence_end,
-        cross_cache_batch_size=args.window_batch_size,
-        cross_key_caches=sampler.cross_key_caches,
-        cross_value_caches=sampler.cross_value_caches,
-    )
+    sampler_batch_sizes = static_window_batch_sizes(args.window_batch_size)
+    sampler_pairs: dict[int, tuple[plu_test.Mxfp8KvCacheCudaGraphSampler, plu_test.Mxfp8KvCacheCudaGraphSampler]] = {}
+    for static_window_batch_size in sampler_batch_sizes:
+        sampler = plu_test.Mxfp8KvCacheCudaGraphSampler(
+            model,
+            tokenizer,
+            packed,
+            base_prompt,
+            suppress,
+            decode_batch_size=args.decode_batch_size * static_window_batch_size,
+            timestamps_after_sentence_end=args.timestamps_after_sentence_end,
+            cross_cache_batch_size=static_window_batch_size,
+        )
+        prefill_sampler = plu_test.Mxfp8KvCacheCudaGraphSampler(
+            model,
+            tokenizer,
+            packed,
+            base_prompt,
+            suppress,
+            decode_batch_size=static_window_batch_size,
+            timestamps_after_sentence_end=args.timestamps_after_sentence_end,
+            cross_cache_batch_size=static_window_batch_size,
+            cross_key_caches=sampler.cross_key_caches,
+            cross_value_caches=sampler.cross_value_caches,
+        )
+        sampler_pairs[static_window_batch_size] = (sampler, prefill_sampler)
 
     rows = read_wav_scp(args.wav_scp)
     if args.limit is not None:
@@ -292,6 +313,7 @@ def main() -> None:
                 "decode_batch_size": args.decode_batch_size,
                 "window_batch_size": args.window_batch_size,
                 "audio_load_workers": args.audio_load_workers,
+                "sampler_window_batch_sizes": sampler_batch_sizes,
                 "sampler_decode_batch_size": args.decode_batch_size * args.window_batch_size,
                 "sampler_cross_cache_batch_size": args.window_batch_size,
                 "encoder_window_batch_size": 1,
@@ -306,7 +328,9 @@ def main() -> None:
                 "max_previous_tokens": max_previous_tokens,
                 "time_precision": time_precision,
                 "mxfp8_packed_linear_count": stats["mx_packed_linear_count"],
-                "cuda_graph_capture_ms": sampler.capture_ms + prefill_sampler.capture_ms,
+                "cuda_graph_capture_ms": sum(
+                    sampler.capture_ms + prefill_sampler.capture_ms for sampler, prefill_sampler in sampler_pairs.values()
+                ),
             },
             indent=2,
             sort_keys=True,
@@ -416,7 +440,8 @@ def main() -> None:
                 )
                 total_windows += 1
 
-            while len(prompts) < args.window_batch_size:
+            static_window_batch_size = select_static_window_batch_size(len(prompts), sampler_batch_sizes)
+            while len(prompts) < static_window_batch_size:
                 prompts.append(prompts[-1])
                 audio_segments.append(audio_segments[-1])
             total_batch_prep_seconds += time.perf_counter() - batch_prep_start
@@ -450,6 +475,7 @@ def main() -> None:
             sample_start = time.perf_counter()
             if stage_events is not None:
                 stage_events[4].record()
+            sampler, prefill_sampler = sampler_pairs[static_window_batch_size]
             grouped_samples = sampler.sample_many_grouped_compact_prefill(
                 prefill_sampler,
                 encoder_hidden_states,
