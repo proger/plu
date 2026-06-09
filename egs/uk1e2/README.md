@@ -15,8 +15,7 @@ Default model settings match the accelerated large-v3-turbo path and require CUD
 - test language: `uk`
 - test dtype: CUDA `bf16`, with MXFP8-packed linear weights
 - learning rate: `1e-6`
-- train steps: `100`
-- internal `+train` eval: first `4` files, to keep the recipe quick
+- train steps: one pass over the selected subset (`100` rows by default)
 
 Run:
 
@@ -27,16 +26,14 @@ python egs/uk1e2/run.py
 Useful overrides:
 
 ```bash
-N=100 TRAIN_STEPS=20 python egs/uk1e2/run.py
+N=100 python egs/uk1e2/run.py
 python egs/uk1e2/run.py --stage 3 --stop-stage 5
-MODEL_NAME_OR_PATH=openai/whisper-small BASELINE_MODEL=small N_MELS=80 python egs/uk1e2/run.py
-TEST_DTYPE=fp16 python egs/uk1e2/run.py
+INIT=openai/whisper-small BASELINE_MODEL=small N_MELS=80 python egs/uk1e2/run.py
 ```
 
-Outputs are written under `egs/uk1e2/exp/news_100_lr1e-6/`:
+Outputs are written under `egs/uk1e2/exp/news_100_large-v3-turbo_bf16_b1_ebwd24_cudagraph_mxfp8/` by default:
 
 - `data/subset.jsonl`: train/eval JSONL with `input_ids`
-- `data/train_eval.jsonl`: small internal eval slice for `+train`
 - `data/wav.list`: the 100 audio files passed to `+test`
 - `before.test.jsonl`: baseline `+test` segments
 - `before.wer.json`: baseline WER

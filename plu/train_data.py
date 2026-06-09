@@ -78,24 +78,42 @@ def _load_wav(path: Path, sample_rate: int = SAMPLE_RATE) -> torch.Tensor:
     return _resample(audio, source_rate, sample_rate)
 
 
-def _load_with_ffmpeg(path: Path, sample_rate: int = SAMPLE_RATE) -> torch.Tensor:
+def _load_with_ffmpeg(
+    path: Path,
+    sample_rate: int = SAMPLE_RATE,
+    *,
+    start: float | None = None,
+    duration: float | None = None,
+) -> torch.Tensor:
     cmd = [
         "ffmpeg",
         "-nostdin",
         "-threads",
         "0",
-        "-i",
-        str(path),
-        "-f",
-        "s16le",
-        "-ac",
-        "1",
-        "-acodec",
-        "pcm_s16le",
-        "-ar",
-        str(sample_rate),
-        "-",
     ]
+    if start is not None:
+        cmd.extend(["-ss", f"{float(start):.6f}"])
+    cmd.extend(
+        [
+            "-i",
+            str(path),
+        ]
+    )
+    if duration is not None:
+        cmd.extend(["-t", f"{float(duration):.6f}"])
+    cmd.extend(
+        [
+            "-f",
+            "s16le",
+            "-ac",
+            "1",
+            "-acodec",
+            "pcm_s16le",
+            "-ar",
+            str(sample_rate),
+            "-",
+        ]
+    )
     process = subprocess.run(cmd, capture_output=True, check=True)
     return torch.frombuffer(bytearray(process.stdout), dtype=torch.int16).flatten().float() / 32768.0
 
@@ -158,16 +176,32 @@ def _load_npz(path: Path, key: str | None = None) -> torch.Tensor:
         return _load_npy_bytes(archive.read(selected))
 
 
-def load_audio(path: str | Path, sample_rate: int = SAMPLE_RATE) -> torch.Tensor:
+def _slice_audio(audio: torch.Tensor, start: float | None, duration: float | None, sample_rate: int) -> torch.Tensor:
+    if start is None and duration is None:
+        return audio
+    start_sample = max(0, round(float(start or 0.0) * sample_rate))
+    if duration is None:
+        return audio[start_sample:]
+    end_sample = start_sample + max(0, round(float(duration) * sample_rate))
+    return audio[start_sample:end_sample]
+
+
+def load_audio(
+    path: str | Path,
+    sample_rate: int = SAMPLE_RATE,
+    *,
+    start: float | None = None,
+    duration: float | None = None,
+) -> torch.Tensor:
     path = Path(path)
     suffix = path.suffix.lower()
     if suffix == ".npy":
-        return _load_npy(path)
+        return _slice_audio(_load_npy(path), start, duration, sample_rate)
     if suffix == ".npz":
-        return _load_npz(path)
-    if suffix == ".wav":
+        return _slice_audio(_load_npz(path), start, duration, sample_rate)
+    if suffix == ".wav" and start is None and duration is None:
         return _load_wav(path, sample_rate)
-    return _load_with_ffmpeg(path, sample_rate)
+    return _load_with_ffmpeg(path, sample_rate, start=start, duration=duration)
 
 
 def pad_or_trim(audio: torch.Tensor, length: int = N_SAMPLES) -> torch.Tensor:
@@ -315,7 +349,11 @@ class JsonlAudioDataset(Dataset):
             audio_path = example.get("path") or example.get("audio")
             if audio_path is None:
                 raise ValueError("dataset example must contain path, audio, or input_features")
-            input_features = log_mel_spectrogram(load_audio(audio_path), self.n_mels)
+            start = example.get("start")
+            duration = example.get("duration") if start is not None else None
+            if start is not None and duration is None and example.get("end") is not None:
+                duration = max(0.0, float(example["end"]) - float(start))
+            input_features = log_mel_spectrogram(load_audio(audio_path, start=start, duration=duration), self.n_mels)
 
         labels = example.get("input_ids") or example.get("labels")
         if labels is None:
@@ -385,32 +423,14 @@ class Corpus:
         args = self.args
         return DataLoader(
             dataset,
-            batch_size=args.per_device_train_batch_size,
+            batch_size=1,
             collate_fn=self.data_collator,
             num_workers=args.dataloader_num_workers,
             pin_memory=args.dataloader_pin_memory,
             shuffle=False,
         )
-
-    def make_eval_dataloader(self, dataset: Dataset) -> DataLoader:
-        args = self.args
-        return DataLoader(
-            dataset,
-            batch_size=args.per_device_eval_batch_size,
-            collate_fn=self.data_collator,
-            num_workers=args.dataloader_num_workers,
-            pin_memory=args.dataloader_pin_memory,
-            shuffle=False,
-        )
-
 
 def register_data_args(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--train", type=str, nargs="+", help="jsonl filename for training data, can be multiple files", required=False)
-    parser.add_argument("--eval", type=str, help="jsonl filename for evaluation data", required=True)
-    parser.add_argument("--preprocessing_num_workers", type=int, default=4, help="Kept for CLI compatibility; JSONL loading is local.")
-    parser.add_argument("--per_device_train_batch_size", type=int, default=8, help="Batch size for the training dataloader.")
-    parser.add_argument("--per_device_eval_batch_size", type=int, default=8, help="Batch size for the evaluation dataloader.")
-    parser.add_argument("--language", type=str, help="Language code retained for CLI compatibility.", default="Russian")
-    parser.add_argument("--task", type=str, default="transcribe", help="Task retained for CLI compatibility.", required=False)
     parser.add_argument("--dataloader_pin_memory", type=str_to_bool, default=True, help="Whether or not to pin memory for the DataLoader.")
     parser.add_argument("--dataloader_num_workers", type=int, default=4, help="Number of subprocesses to use for data loading.")

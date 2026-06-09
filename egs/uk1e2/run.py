@@ -87,17 +87,11 @@ def main() -> None:
     wav_scp = Path(env_str("WAV_SCP", "data/segments/wav.scp"))
     text_full = Path(env_str("TEXT_FULL", "data/local/text.full"))
 
-    model_name_or_path = env_str("MODEL_NAME_OR_PATH", "openai/whisper-large-v3-turbo")
+    init = env_str("INIT", "openai/whisper-large-v3-turbo")
     baseline_model = env_str("BASELINE_MODEL", "large-v3-turbo")
 
-    train_steps = env_int("TRAIN_STEPS", 100)
-    train_batch_size = env_int("TRAIN_BATCH_SIZE", 1)
-    eval_batch_size = env_int("EVAL_BATCH_SIZE", 4)
     train_eval_limit = env_int("TRAIN_EVAL_LIMIT", 4)
-    gradient_accumulation_steps = env_int("GRADIENT_ACCUMULATION_STEPS", 1)
     learning_rate = env_str("LEARNING_RATE", "1e-6")
-    static_input_features = env_int("STATIC_INPUT_FEATURES", 3000)
-    static_decoder_len = env_int("STATIC_DECODER_LEN", 448)
 
     test_device = env_str("TEST_DEVICE", "cuda")
     test_dtype = env_str("TEST_DTYPE", "bf16")
@@ -211,34 +205,18 @@ def main() -> None:
         run(
             [
                 "+train",
-                "--model_name_or_path",
-                model_name_or_path,
+                "--init",
+                init,
                 "--train",
                 rel(data_dir / "subset.jsonl", root),
-                "--eval",
-                rel(data_dir / "train_eval.jsonl", root),
                 "--exp",
                 rel(train_exp, root),
                 "--learning_rate",
                 learning_rate,
-                "--max_train_steps",
-                str(train_steps),
-                "--per_device_train_batch_size",
-                str(train_batch_size),
-                "--per_device_eval_batch_size",
-                str(eval_batch_size),
-                "--gradient_accumulation_steps",
-                str(gradient_accumulation_steps),
                 "--dataloader_num_workers",
                 "0",
                 "--dataloader_pin_memory",
                 "false",
-                "--device",
-                "cuda",
-                "--static_input_features",
-                str(static_input_features),
-                "--static_decoder_len",
-                str(static_decoder_len),
             ],
             root=root,
             env=env,
