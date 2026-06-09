@@ -329,17 +329,10 @@ class Mxfp8KvCacheCudaGraphSampler:
         return cached
 
     def _project_heads(self, module: torch.nn.Module, hidden_states: torch.Tensor) -> torch.Tensor:
-        from plu.benchmarks.bench_end_to_end import _packed_linear
+        return self.packed[id(module)].heads(hidden_states, self.model.config.decoder_attention_heads, master_weight_grads=False)
 
-        projected = _packed_linear(self.packed, module, hidden_states, master_weight_grads=False)
-        batch, seq_len, features = projected.shape
-        heads = self.model.config.decoder_attention_heads
-        head_dim = features // heads
-        return projected.reshape(batch, seq_len, heads, head_dim).permute(0, 2, 1, 3).contiguous()
-
-    def _merge_heads(self, hidden_states: torch.Tensor) -> torch.Tensor:
-        batch, heads, seq_len, head_dim = hidden_states.shape
-        return hidden_states.permute(0, 2, 1, 3).contiguous().reshape(batch, seq_len, heads * head_dim)
+    def _project_from_heads(self, module: torch.nn.Module, hidden_states: torch.Tensor) -> torch.Tensor:
+        return self.packed[id(module)].from_heads(hidden_states, master_weight_grads=False)
 
     def _token_embedding(self) -> torch.Tensor:
         decoder = self.model.model.decoder
@@ -395,7 +388,7 @@ class Mxfp8KvCacheCudaGraphSampler:
                 self.self_value_caches[index],
                 self.static_position,
             )
-            hidden_states = _packed_linear(self.packed, layer.self_attn.out_proj, self._merge_heads(attended), master_weight_grads=False)
+            hidden_states = self._project_from_heads(layer.self_attn.out_proj, attended)
             hidden_states = residual_add(residual, hidden_states)
 
             residual = hidden_states
@@ -403,7 +396,7 @@ class Mxfp8KvCacheCudaGraphSampler:
             query = self._project_heads(layer.encoder_attn.q_proj, normed)
             cross_cache_index = self.static_cross_cache_index if self.cross_cache_batch_size != self.decode_batch_size else None
             attended = cross_kv_cache_attention(query, self.cross_key_caches[index], self.cross_value_caches[index], cross_cache_index)
-            hidden_states = _packed_linear(self.packed, layer.encoder_attn.out_proj, self._merge_heads(attended), master_weight_grads=False)
+            hidden_states = self._project_from_heads(layer.encoder_attn.out_proj, attended)
             hidden_states = residual_add(residual, hidden_states)
 
             residual = hidden_states
