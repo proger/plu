@@ -35,7 +35,7 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--language", default="uk")
     parser.add_argument("--device", default="cuda")
-    parser.add_argument("--dtype", default="bf16", choices=["bf16", "fp16"])
+    parser.add_argument("--dtype", default="bf16", choices=["bf16"])
     parser.add_argument("--window-seconds", type=float, default=30.0)
     parser.add_argument("--hop-seconds", type=float, default=15.0)
     parser.add_argument("--min-window-seconds", type=float, default=1.0)

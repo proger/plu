@@ -65,7 +65,7 @@ def parse_args() -> argparse.Namespace:
         "--dtype",
         type=str,
         default="bf16",
-        choices=["bf16", "fp16"],
+        choices=["bf16"],
         help="Activation dtype for PLU inference.",
     )
     parser.add_argument(
@@ -98,8 +98,6 @@ def parse_args() -> argparse.Namespace:
 def parse_dtype(name: str) -> torch.dtype:
     if name == "bf16":
         return torch.bfloat16
-    if name == "fp16":
-        return torch.float16
     raise ValueError(f"unsupported dtype: {name}")
 
 

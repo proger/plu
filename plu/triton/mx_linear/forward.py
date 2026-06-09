@@ -217,7 +217,7 @@ def _mxfp8_linear_kernel(
             mask=(offs_m[:, None] < rows) & (k[None, :] < in_features),
             other=0.0,
         )
-        x_scaled = x.to(tl.bfloat16) if input_format == "bf16" else x.to(tl.float16)
+        x_scaled = x.to(tl.bfloat16)
         weight_t = tl.load(
             weight_ptr + offs_n[None, :] * padded_in_features + k[:, None],
             mask=(offs_n[None, :] < out_features) & (k[:, None] < padded_in_features),
@@ -282,7 +282,7 @@ def _mxfp4_linear_kernel(
             mask=(offs_m[:, None] < rows) & (k[None, :] < in_features),
             other=0.0,
         )
-        x_scaled = x.to(tl.bfloat16) if input_format == "bf16" else x.to(tl.float16)
+        x_scaled = x.to(tl.bfloat16)
         packed_k = scale_group * 64 + offs_packed_k
         packed_t = tl.load(
             weight_ptr + offs_n[None, :] * packed_in_features + packed_k[:, None],
@@ -526,9 +526,7 @@ def _check_packed_shapes(
 def _dot_scaled_input_format(x: Tensor, op_name: str) -> str:
     if x.dtype == torch.bfloat16:
         return "bf16"
-    if x.dtype == torch.float16:
-        return "fp16"
-    raise RuntimeError(f"{op_name} requires bf16 or fp16 inputs")
+    raise RuntimeError(f"{op_name} requires bf16 inputs")
 
 
 def mxfp8_linear_2d(

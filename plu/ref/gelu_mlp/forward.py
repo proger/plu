@@ -5,7 +5,7 @@ import torch.nn.functional as F
 from torch import Tensor
 
 
-_LOW_PRECISION_FLOAT_DTYPES = (torch.bfloat16, torch.float16)
+_LOW_PRECISION_FLOAT_DTYPES = (torch.bfloat16,)
 
 
 def gelu_mlp(x: Tensor, fc1_weight: Tensor, fc1_bias: Tensor | None, fc2_weight: Tensor, fc2_bias: Tensor | None) -> Tensor:

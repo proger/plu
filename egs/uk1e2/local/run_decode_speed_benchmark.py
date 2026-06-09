@@ -25,7 +25,7 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--language", default="uk")
     parser.add_argument("--device", default="cuda")
-    parser.add_argument("--dtype", default="bf16", choices=["bf16", "fp16"])
+    parser.add_argument("--dtype", default="bf16", choices=["bf16"])
     parser.add_argument("--decode-batch-size", type=int, default=8, help="Alternatives per decoded window.")
     parser.add_argument("--window-batch-sizes", type=int, nargs="+", default=[2, 4, 8, 16, 32])
     parser.add_argument("--batched-audio-load-workers", type=int, default=4)

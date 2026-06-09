@@ -212,7 +212,7 @@ def linear_input_gelu_grad_recompute(
     rows, out_features = grad_out.shape
     hidden_features = fc2_weight.shape[1]
     input_features = x.shape[1]
-    grad_dtype = torch.float32 if x.dtype in (torch.bfloat16, torch.float16) else x.dtype
+    grad_dtype = torch.float32 if x.dtype is torch.bfloat16 else x.dtype
     grad_input = torch.empty((rows, hidden_features), device=grad_out.device, dtype=grad_dtype)
     if rows == 0:
         return grad_input

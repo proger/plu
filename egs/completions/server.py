@@ -323,7 +323,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--model", default=None, help="HF model id, alias, or local model directory. Overrides --exp.")
     parser.add_argument("--download-root", type=Path, default=None)
     parser.add_argument("--device", default="cuda")
-    parser.add_argument("--dtype", default="bf16", choices=["bf16", "fp16"])
+    parser.add_argument("--dtype", default="bf16", choices=["bf16"])
     parser.add_argument("--language", default="uk")
     parser.add_argument("--audio", type=Path, default=DEFAULT_AUDIO)
     parser.add_argument("--decode-batch-size", type=int, default=8)

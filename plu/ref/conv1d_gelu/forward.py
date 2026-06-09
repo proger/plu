@@ -5,7 +5,7 @@ import torch.nn.functional as F
 from torch import Tensor
 
 
-_LOW_PRECISION_FLOAT_DTYPES = (torch.bfloat16, torch.float16)
+_LOW_PRECISION_FLOAT_DTYPES = (torch.bfloat16,)
 
 
 def conv1d_gelu(x: Tensor, weight: Tensor, bias: Tensor | None, stride: int, padding: int) -> Tensor:
