@@ -4,6 +4,7 @@ import argparse
 import os
 import subprocess
 import sys
+from dataclasses import dataclass
 from pathlib import Path
 
 import pytest
@@ -19,6 +20,14 @@ DEFAULT_MODEL = (
 GRAD_SLICE = 128
 DECODER_TOKENS = 4
 ENCODER_BACKWARD_LAYERS = 24
+
+
+@dataclass
+class LimitedForwardResult:
+    output: object
+    encoder_backward_layer_start: int
+    frozen_encoder_packed_linear_count: int
+    activations: dict[str, torch.Tensor]
 
 
 def _set_tf32(enabled: bool) -> None:
@@ -120,7 +129,7 @@ def _limited_forward(
     labels: torch.Tensor,
     *,
     frozen_encoder_mxfp8: bool,
-):
+) -> LimitedForwardResult:
     from plu.benchmarks.bench_end_to_end import _packed_encoder_layer, encoder_backward_start
     from plu.whisper import Seq2SeqOutput, cross_entropy, encoder_position_embedding, shift_tokens_right
 
@@ -128,6 +137,8 @@ def _limited_forward(
     hidden_states = encoder.conv1(input_features)
     hidden_states = encoder.conv2(hidden_states)
     hidden_states = hidden_states.transpose(1, 2)
+    if hidden_states.shape[1] > encoder.config.max_source_positions:
+        raise ValueError(f"input features are too long: {hidden_states.shape[1]} > {encoder.config.max_source_positions}")
     hidden_states = encoder_position_embedding(hidden_states, encoder.embed_positions.weight)
 
     backward_start = encoder_backward_start(len(encoder.layers), ENCODER_BACKWARD_LAYERS)
@@ -148,7 +159,15 @@ def _limited_forward(
     decoder_hidden_states = model.model.decoder(decoder_input_ids, encoder_hidden_states)
     logits = model.proj_out(decoder_hidden_states).float()
     loss = cross_entropy(logits, labels, ignore_index=-100)
-    return Seq2SeqOutput(loss=loss, logits=logits), backward_start, len(packed) if packed is not None else 0
+    return LimitedForwardResult(
+        output=Seq2SeqOutput(loss=loss, logits=logits),
+        encoder_backward_layer_start=backward_start,
+        frozen_encoder_packed_linear_count=len(packed) if packed is not None else 0,
+        activations={
+            "encoder_hidden": encoder_hidden_states.detach().float().cpu(),
+            "decoder_hidden": decoder_hidden_states.detach().float().cpu(),
+        },
+    )
 
 
 def _child_main() -> None:
@@ -177,34 +196,19 @@ def _child_main() -> None:
     model.train()
     model.zero_grad(set_to_none=True)
 
-    activations: dict[str, torch.Tensor] = {}
-
-    def save_activation(name: str):
-        def hook(_module, _inputs, output):
-            activations[name] = output.detach().float().cpu()
-
-        return hook
-
-    handles = [
-        model.model.encoder.register_forward_hook(save_activation("encoder_hidden")),
-        model.model.decoder.register_forward_hook(save_activation("decoder_hidden")),
-    ]
-    try:
-        output, encoder_backward_layer_start, frozen_encoder_packed_linear_count = _limited_forward(
-            model,
-            input_features,
-            labels,
-            frozen_encoder_mxfp8=args.frozen_encoder_mxfp8,
-        )
-        assert output.loss is not None
-        output.loss.backward()
-        torch.cuda.synchronize()
-    finally:
-        for handle in handles:
-            handle.remove()
+    limited = _limited_forward(
+        model,
+        input_features,
+        labels,
+        frozen_encoder_mxfp8=args.frozen_encoder_mxfp8,
+    )
+    output = limited.output
+    assert output.loss is not None
+    output.loss.backward()
+    torch.cuda.synchronize()
 
     frozen_encoder_layer = model.model.encoder.layers[0]
-    encoder_layer = model.model.encoder.layers[encoder_backward_layer_start]
+    encoder_layer = model.model.encoder.layers[limited.encoder_backward_layer_start]
     decoder_layer = model.model.decoder.layers[0]
     result = {
         "backend": args.backend,
@@ -212,15 +216,15 @@ def _child_main() -> None:
         "input_dtype": str(input_features.dtype),
         "layer_norm_parameter_dtypes": _layer_norm_parameter_dtypes(model),
         "encoder_backward_layers": ENCODER_BACKWARD_LAYERS,
-        "encoder_backward_layer_start": encoder_backward_layer_start,
+        "encoder_backward_layer_start": limited.encoder_backward_layer_start,
         "frozen_encoder_weight_format": "mxfp8" if args.frozen_encoder_mxfp8 else "bf16",
-        "frozen_encoder_packed_linear_count": frozen_encoder_packed_linear_count,
+        "frozen_encoder_packed_linear_count": limited.frozen_encoder_packed_linear_count,
         "frozen_encoder_self_q_weight_grad_is_none": frozen_encoder_layer.self_attn.q_proj.weight.grad is None,
         "encoder_conv1_weight_grad_is_none": model.model.encoder.conv1.weight.grad is None,
         "labels": labels.detach().cpu(),
         "loss": output.loss.detach().float().cpu(),
         "logits": output.logits.detach().float().cpu(),
-        "activations": activations,
+        "activations": limited.activations,
         "grads": {
             "encoder_train_self_q_weight": _slice_grad(encoder_layer.self_attn.q_proj.weight),
             "encoder_train_mlp_fc1_weight": _slice_grad(encoder_layer.fc1.weight),
@@ -295,6 +299,17 @@ def _assert_rel_l2(
     )
 
 
+def _assert_activation_payload(name: str, result: dict) -> None:
+    expected = {"encoder_hidden", "decoder_hidden"}
+    actual = set(result["activations"])
+    assert actual == expected, f"{name}: activation keys {sorted(actual)} != {sorted(expected)}"
+    for activation_name, tensor in result["activations"].items():
+        assert tensor.dtype == torch.float32, f"{name}.{activation_name}: expected saved float32 tensor, got {tensor.dtype}"
+        assert tensor.ndim == 3, f"{name}.{activation_name}: expected rank-3 hidden state, got rank {tensor.ndim}"
+        assert tensor.numel() > 0, f"{name}.{activation_name}: empty activation"
+        assert torch.isfinite(tensor).all(), f"{name}.{activation_name}: activation has non-finite values"
+
+
 def _assert_grad_sanity(name: str, actual: torch.Tensor, expected: torch.Tensor) -> None:
     actual_norm = float(actual.detach().float().norm())
     expected_norm = float(expected.detach().float().norm())
@@ -319,6 +334,8 @@ def test_whisper_turbo_real_inputs_bf16_weights_end_to_end_numerics(tmp_path: Pa
 
     ref = _torch_load(ref_path)
     triton = _torch_load(triton_path)
+    _assert_activation_payload("ref", ref)
+    _assert_activation_payload("triton", triton)
     assert ref["weight_dtype"] == "torch.bfloat16"
     assert triton["weight_dtype"] == "torch.bfloat16"
     assert ref["input_dtype"] == "torch.bfloat16"
