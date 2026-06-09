@@ -343,6 +343,7 @@ class JsonlAudioDataset(Dataset):
 
     def __getitem__(self, index: int) -> dict[str, Any]:
         example = self.examples[index]
+        duration = example.get("duration")
         if "input_features" in example:
             input_features = torch.tensor(example["input_features"], dtype=torch.float32)
         else:
@@ -350,10 +351,13 @@ class JsonlAudioDataset(Dataset):
             if audio_path is None:
                 raise ValueError("dataset example must contain path, audio, or input_features")
             start = example.get("start")
-            duration = example.get("duration") if start is not None else None
-            if start is not None and duration is None and example.get("end") is not None:
-                duration = max(0.0, float(example["end"]) - float(start))
-            input_features = log_mel_spectrogram(load_audio(audio_path, start=start, duration=duration), self.n_mels)
+            load_duration = duration if start is not None else None
+            if start is not None and load_duration is None and example.get("end") is not None:
+                load_duration = max(0.0, float(example["end"]) - float(start))
+            audio = load_audio(audio_path, start=start, duration=load_duration)
+            if duration is None:
+                duration = audio.numel() / SAMPLE_RATE
+            input_features = log_mel_spectrogram(audio, self.n_mels)
 
         labels = example.get("input_ids") or example.get("labels")
         if labels is None:
@@ -363,7 +367,7 @@ class JsonlAudioDataset(Dataset):
             "input_features": input_features,
             "labels": torch.tensor(labels, dtype=torch.long),
             "text": example.get("text"),
-            "duration": example.get("duration"),
+            "duration": duration,
         }
 
 
