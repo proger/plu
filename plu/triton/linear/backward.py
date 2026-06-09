@@ -1,11 +1,79 @@
 from __future__ import annotations
 
-import os
+from collections.abc import Iterator
+from contextlib import contextmanager
+from dataclasses import dataclass
 
 import torch
 import triton
 import triton.language as tl
 from torch import Tensor
+
+
+@dataclass
+class LinearGradNormRecord:
+    weight_norm_sq: Tensor
+    bias_norm_sq: Tensor | None
+    weight_elements: int
+    bias_elements: int
+
+
+_LINEAR_GRAD_NORM_RECORDS: list[LinearGradNormRecord] | None = None
+
+
+@contextmanager
+def collect_linear_grad_norms() -> Iterator[list[LinearGradNormRecord]]:
+    global _LINEAR_GRAD_NORM_RECORDS
+    previous = _LINEAR_GRAD_NORM_RECORDS
+    records: list[LinearGradNormRecord] = []
+    _LINEAR_GRAD_NORM_RECORDS = records
+    try:
+        yield records
+    finally:
+        _LINEAR_GRAD_NORM_RECORDS = previous
+
+
+def _record_linear_grad_norms(
+    weight_norm_sq: Tensor,
+    bias_norm_sq: Tensor | None,
+    weight_elements: int,
+    bias_elements: int,
+) -> None:
+    if _LINEAR_GRAD_NORM_RECORDS is not None:
+        _LINEAR_GRAD_NORM_RECORDS.append(
+            LinearGradNormRecord(
+                weight_norm_sq=weight_norm_sq,
+                bias_norm_sq=bias_norm_sq,
+                weight_elements=weight_elements,
+                bias_elements=bias_elements,
+            )
+        )
+
+
+@torch.no_grad()
+def summarize_linear_grad_norms(records: list[LinearGradNormRecord]) -> dict[str, float]:
+    if not records:
+        return {
+            "train/grad_norm/linear_calls": 0.0,
+            "train/grad_norm/linear_total": 0.0,
+            "train/grad_norm/linear_weight": 0.0,
+            "train/grad_norm/linear_bias": 0.0,
+        }
+
+    weight_norm_sq = torch.stack([record.weight_norm_sq.reshape(-1).sum() for record in records]).sum()
+    bias_parts = [record.bias_norm_sq.reshape(-1).sum() for record in records if record.bias_norm_sq is not None]
+    bias_norm_sq = torch.stack(bias_parts).sum() if bias_parts else weight_norm_sq.new_zeros(())
+    weight_value = float(weight_norm_sq.detach().cpu())
+    bias_value = float(bias_norm_sq.detach().cpu())
+    total_value = weight_value + bias_value
+    return {
+        "train/grad_norm/linear_calls": float(len(records)),
+        "train/grad_norm/linear_weight_elements": float(sum(record.weight_elements for record in records)),
+        "train/grad_norm/linear_bias_elements": float(sum(record.bias_elements for record in records)),
+        "train/grad_norm/linear_weight": weight_value**0.5,
+        "train/grad_norm/linear_bias": bias_value**0.5,
+        "train/grad_norm/linear_total": total_value**0.5,
+    }
 
 
 @triton.jit
@@ -57,78 +125,25 @@ def _linear_input_grad_kernel(
 
 
 @triton.jit
-def _linear_weight_grad_kernel(
-    grad_out_ptr,
-    input_ptr,
-    grad_weight_ptr,
-    grad_bias_ptr,
-    rows: tl.constexpr,
-    out_features: tl.constexpr,
-    in_features: tl.constexpr,
-    has_bias: tl.constexpr,
-    use_tf32: tl.constexpr,
-    cast_grad_to_float: tl.constexpr,
-    cast_input_to_float: tl.constexpr,
-    block_n: tl.constexpr,
-    block_k: tl.constexpr,
-    block_m: tl.constexpr,
-):
-    pid_n = tl.program_id(0)
-    pid_k = tl.program_id(1)
-    pid_m = tl.program_id(2)
-    offs_n = pid_n * block_n + tl.arange(0, block_n)
-    offs_k = pid_k * block_k + tl.arange(0, block_k)
-    offs_m = pid_m * block_m + tl.arange(0, block_m)
-    grad = tl.load(
-        grad_out_ptr + offs_m[:, None] * out_features + offs_n[None, :],
-        mask=(offs_m[:, None] < rows) & (offs_n[None, :] < out_features),
-        other=0.0,
-    )
-    x = tl.load(
-        input_ptr + offs_m[:, None] * in_features + offs_k[None, :],
-        mask=(offs_m[:, None] < rows) & (offs_k[None, :] < in_features),
-        other=0.0,
-    )
-    if has_bias:
-        bias_acc = tl.sum(grad, axis=0)
-        tl.atomic_add(
-            grad_bias_ptr + offs_n,
-            bias_acc,
-            sem="relaxed",
-            mask=(pid_k == 0) & (offs_n < out_features),
-        )
-    if cast_grad_to_float:
-        grad = grad.to(tl.float32)
-    if cast_input_to_float:
-        x = x.to(tl.float32)
-    if use_tf32:
-        acc = tl.dot(tl.trans(grad), x, input_precision="tf32")
-    else:
-        acc = tl.dot(tl.trans(grad), x, input_precision="ieee")
-    tl.atomic_add(
-        grad_weight_ptr + offs_n[:, None] * in_features + offs_k[None, :],
-        acc,
-        sem="relaxed",
-        mask=(offs_n[:, None] < out_features) & (offs_k[None, :] < in_features),
-    )
-
-
-@triton.jit
 def _linear_weight_grad_reduce_kernel(
     grad_out_ptr,
     input_ptr,
     grad_weight_ptr,
     grad_bias_ptr,
+    grad_weight_norm_sq_ptr,
+    grad_bias_norm_sq_ptr,
     rows: tl.constexpr,
     out_features: tl.constexpr,
     in_features: tl.constexpr,
     has_bias: tl.constexpr,
+    collect_norms: tl.constexpr,
     use_tf32: tl.constexpr,
     cast_grad_to_float: tl.constexpr,
     cast_input_to_float: tl.constexpr,
     block_n: tl.constexpr,
     block_k: tl.constexpr,
     block_m: tl.constexpr,
+    grid_k: tl.constexpr,
 ):
     pid_n = tl.program_id(0)
     pid_k = tl.program_id(1)
@@ -166,28 +181,14 @@ def _linear_weight_grad_reduce_kernel(
     )
     if has_bias:
         tl.store(grad_bias_ptr + offs_n, bias_acc, mask=(pid_k == 0) & (offs_n < out_features))
-
-
-@triton.jit
-def _linear_bias_grad_kernel(
-    grad_out_ptr,
-    grad_bias_ptr,
-    rows: tl.constexpr,
-    out_features: tl.constexpr,
-    block_n: tl.constexpr,
-    block_m: tl.constexpr,
-):
-    pid_n = tl.program_id(0)
-    pid_m = tl.program_id(1)
-    offs_n = pid_n * block_n + tl.arange(0, block_n)
-    offs_m = pid_m * block_m + tl.arange(0, block_m)
-    grad = tl.load(
-        grad_out_ptr + offs_m[:, None] * out_features + offs_n[None, :],
-        mask=(offs_m[:, None] < rows) & (offs_n[None, :] < out_features),
-        other=0.0,
-    )
-    acc = tl.sum(grad, axis=0)
-    tl.atomic_add(grad_bias_ptr + offs_n, acc, sem="relaxed", mask=offs_n < out_features)
+    if collect_norms:
+        weight_mask = (offs_n[:, None] < out_features) & (offs_k[None, :] < in_features)
+        weight_norm_sq = tl.sum(tl.where(weight_mask, acc * acc, 0.0))
+        tl.store(grad_weight_norm_sq_ptr + pid_n * grid_k + pid_k, weight_norm_sq)
+        if has_bias and pid_k == 0:
+            bias_mask = offs_n < out_features
+            bias_norm_sq = tl.sum(tl.where(bias_mask, bias_acc * bias_acc, 0.0))
+            tl.store(grad_bias_norm_sq_ptr + pid_n, bias_norm_sq)
 
 
 def linear_input_grad(grad_out: Tensor, weight: Tensor, out_dtype: torch.dtype | None = None) -> Tensor:
@@ -229,87 +230,69 @@ def linear_weight_bias_grad(grad_out: Tensor, x: Tensor, has_bias: bool, dtype: 
     in_features = x.shape[1]
     grad_dtype = grad_out.dtype if dtype is None else dtype
     use_large_tiles = rows >= 512 and out_features >= 512 and in_features >= 256
-    use_reduce_kernel = use_large_tiles or (rows >= 128 and out_features >= 512 and in_features >= 512)
     cast_grad_to_float = grad_out.dtype != x.dtype and grad_out.dtype != torch.float32
     cast_input_to_float = grad_out.dtype != x.dtype and x.dtype != torch.float32
     inputs_are_fp32 = (grad_out.dtype == torch.float32 or cast_grad_to_float) and (x.dtype == torch.float32 or cast_input_to_float)
-    use_tf32 = inputs_are_fp32 and (use_reduce_kernel or cast_grad_to_float or cast_input_to_float)
-    if use_reduce_kernel:
-        grad_weight = torch.empty((out_features, in_features), device=grad_out.device, dtype=grad_dtype)
-    else:
-        grad_weight = torch.zeros((out_features, in_features), device=grad_out.device, dtype=grad_dtype)
-    grad_bias = torch.zeros(out_features, device=grad_out.device, dtype=grad_dtype) if has_bias else None
+    use_wide_reduce = rows >= 128 and out_features >= 512 and in_features >= 512
+    use_tf32 = inputs_are_fp32 and (use_large_tiles or use_wide_reduce or cast_grad_to_float or cast_input_to_float)
+    grad_weight = torch.empty((out_features, in_features), device=grad_out.device, dtype=grad_dtype)
+    grad_bias = torch.empty(out_features, device=grad_out.device, dtype=grad_dtype) if has_bias else None
     if rows == 0:
         grad_weight.zero_()
+        if grad_bias is not None:
+            grad_bias.zero_()
+        if _LINEAR_GRAD_NORM_RECORDS is not None:
+            zero = torch.zeros((), device=grad_out.device, dtype=torch.float32)
+            _record_linear_grad_norms(zero, zero if has_bias else None, grad_weight.numel(), grad_bias.numel() if grad_bias is not None else 0)
         return grad_weight, grad_bias
 
-    fold_bias_grad = has_bias and os.environ.get("PLU_FOLD_LINEAR_BIAS_GRAD", "1") != "0"
-    if use_reduce_kernel:
-        if rows < 512 and out_features >= 16384:
-            block_n = 64
-            block_k = 128
-            block_m = 16
-        elif rows < 512:
-            block_n = 128
-            block_k = 64
-            block_m = 32
-        else:
-            block_n = 64
-            block_k = 128
-            block_m = 64 if out_features >= 4096 and in_features <= 2048 else 32
-    else:
-        block_n = 32
-        block_k = 32
+    if rows < 512 and out_features >= 16384:
+        block_n = 64
+        block_k = 128
+        block_m = 16
+    elif rows < 512:
+        block_n = 128
+        block_k = 64
         block_m = 32
-    if use_reduce_kernel:
-        inputs_are_bf16 = grad_out.dtype == torch.bfloat16 and x.dtype == torch.bfloat16
-        num_stages = 1 if inputs_are_bf16 and fold_bias_grad else 3
-        _linear_weight_grad_reduce_kernel[(triton.cdiv(out_features, block_n), triton.cdiv(in_features, block_k))](
-            grad_out,
-            x,
-            grad_weight,
-            grad_bias if grad_bias is not None else grad_weight,
-            rows,
-            out_features,
-            in_features,
-            fold_bias_grad,
-            use_tf32,
-            cast_grad_to_float,
-            cast_input_to_float,
-            block_n,
-            block_k,
-            block_m,
-            num_warps=4,
-            num_stages=num_stages,
-        )
     else:
-        _linear_weight_grad_kernel[
-            (triton.cdiv(out_features, block_n), triton.cdiv(in_features, block_k), triton.cdiv(rows, block_m))
-        ](
-            grad_out,
-            x,
-            grad_weight,
-            grad_bias if grad_bias is not None else grad_weight,
-            rows,
-            out_features,
-            in_features,
-            fold_bias_grad,
-            use_tf32,
-            cast_grad_to_float,
-            cast_input_to_float,
-            block_n,
-            block_k,
-            block_m,
-            num_warps=4,
-        )
-    if grad_bias is not None and not fold_bias_grad:
-        _linear_bias_grad_kernel[(triton.cdiv(out_features, block_n), triton.cdiv(rows, block_m))](
-            grad_out,
-            grad_bias,
-            rows,
-            out_features,
-            block_n,
-            block_m,
-            num_warps=4,
+        block_n = 64
+        block_k = 128
+        block_m = 64 if out_features >= 4096 and in_features <= 2048 else 32
+
+    grid_n = triton.cdiv(out_features, block_n)
+    grid_k = triton.cdiv(in_features, block_k)
+    collect_norms = _LINEAR_GRAD_NORM_RECORDS is not None
+    grad_weight_norm_sq = torch.empty((grid_n, grid_k), device=grad_out.device, dtype=torch.float32) if collect_norms else grad_weight
+    grad_bias_norm_sq = torch.empty((grid_n,), device=grad_out.device, dtype=torch.float32) if collect_norms and has_bias else grad_weight
+    inputs_are_bf16 = grad_out.dtype == torch.bfloat16 and x.dtype == torch.bfloat16
+    num_stages = 1 if inputs_are_bf16 and has_bias else 3
+    _linear_weight_grad_reduce_kernel[(grid_n, grid_k)](
+        grad_out,
+        x,
+        grad_weight,
+        grad_bias if grad_bias is not None else grad_weight,
+        grad_weight_norm_sq,
+        grad_bias_norm_sq,
+        rows,
+        out_features,
+        in_features,
+        has_bias,
+        collect_norms,
+        use_tf32,
+        cast_grad_to_float,
+        cast_input_to_float,
+        block_n,
+        block_k,
+        block_m,
+        grid_k,
+        num_warps=4,
+        num_stages=num_stages,
+    )
+    if collect_norms:
+        _record_linear_grad_norms(
+            grad_weight_norm_sq,
+            grad_bias_norm_sq if has_bias else None,
+            grad_weight.numel(),
+            grad_bias.numel() if grad_bias is not None else 0,
         )
     return grad_weight, grad_bias
