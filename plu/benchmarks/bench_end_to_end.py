@@ -179,6 +179,69 @@ class PackedMxLinear:
             )
         raise RuntimeError(f"unsupported packed MX format: {self.format}")
 
+    def heads(self, x: torch.Tensor, num_heads: int, master_weight_grads: bool) -> torch.Tensor:
+        if self.format == "mxfp8":
+            from plu.triton.mx_linear import mxfp8_linear_heads, mxfp8_linear_heads_with_master_weight
+
+            if master_weight_grads:
+                return mxfp8_linear_heads_with_master_weight(
+                    x,
+                    self.packed_weight,
+                    self.scale_codes,
+                    self.in_features,
+                    num_heads,
+                    self.master_weight,
+                    self.bias,
+                    self.input_grad_packed_weight,
+                    self.input_grad_scale_codes,
+                    self.input_grad_in_features,
+                )
+            return mxfp8_linear_heads(
+                x,
+                self.packed_weight,
+                self.scale_codes,
+                self.in_features,
+                num_heads,
+                self.bias,
+                self.input_grad_packed_weight,
+                self.input_grad_scale_codes,
+                self.input_grad_in_features,
+            )
+        projected = self(x, master_weight_grads)
+        batch, seq_len, features = projected.shape
+        head_dim = features // num_heads
+        return projected.reshape(batch, seq_len, num_heads, head_dim).permute(0, 2, 1, 3)
+
+    def from_heads(self, x: torch.Tensor, master_weight_grads: bool) -> torch.Tensor:
+        if self.format == "mxfp8":
+            from plu.triton.mx_linear import mxfp8_linear_from_heads, mxfp8_linear_from_heads_with_master_weight
+
+            if master_weight_grads:
+                return mxfp8_linear_from_heads_with_master_weight(
+                    x,
+                    self.packed_weight,
+                    self.scale_codes,
+                    self.in_features,
+                    self.master_weight,
+                    self.bias,
+                    self.input_grad_packed_weight,
+                    self.input_grad_scale_codes,
+                    self.input_grad_in_features,
+                )
+            return mxfp8_linear_from_heads(
+                x,
+                self.packed_weight,
+                self.scale_codes,
+                self.in_features,
+                self.bias,
+                self.input_grad_packed_weight,
+                self.input_grad_scale_codes,
+                self.input_grad_in_features,
+            )
+        batch, heads, seq_len, head_dim = x.shape
+        merged = x.permute(0, 2, 1, 3).contiguous().reshape(batch, seq_len, heads * head_dim)
+        return self(merged, master_weight_grads)
+
 
 def pack_mx_linear(module: torch.nn.Linear, format: str) -> PackedMxLinear:
     from plu.triton.mx_linear import pack_mxfp4_weight, pack_mxfp8_weight, pack_nvfp4_weight
@@ -268,10 +331,7 @@ def _packed_qkv(
     num_heads: int,
     master_weight_grads: bool,
 ) -> torch.Tensor:
-    projected = _packed_linear(packed, module, x, master_weight_grads)
-    batch, seq_len, features = projected.shape
-    head_dim = features // num_heads
-    return projected.reshape(batch, seq_len, num_heads, head_dim).permute(0, 2, 1, 3).contiguous()
+    return packed[id(module)].heads(x, num_heads, master_weight_grads)
 
 
 def _packed_attention(
@@ -289,9 +349,27 @@ def _packed_attention(
     key = _packed_qkv(packed, module.k_proj, source, module.num_heads, master_weight_grads)
     value = _packed_qkv(packed, module.v_proj, source, module.num_heads, master_weight_grads)
     attended = flash_attention(query, key, value, causal_mask)
-    batch, heads, seq_len, head_dim = attended.shape
-    merged = attended.permute(0, 2, 1, 3).contiguous().reshape(batch, seq_len, heads * head_dim)
-    return _packed_linear(packed, module.out_proj, merged, master_weight_grads)
+    return packed[id(module.out_proj)].from_heads(attended, master_weight_grads)
+
+
+class _PackedGelu(torch.autograd.Function):
+    @staticmethod
+    def forward(ctx, preact: torch.Tensor) -> torch.Tensor:
+        ctx.save_for_backward(preact)
+        from plu.triton.gelu_mlp.backward import gelu_forward
+
+        return gelu_forward(preact)
+
+    @staticmethod
+    def backward(ctx, grad_hidden: torch.Tensor) -> tuple[torch.Tensor]:
+        (preact,) = ctx.saved_tensors
+        from plu.triton.gelu_mlp.backward import gelu_backward
+
+        return (gelu_backward(preact, grad_hidden.contiguous()),)
+
+
+def _packed_gelu(preact: torch.Tensor) -> torch.Tensor:
+    return _PackedGelu.apply(preact)
 
 
 def _packed_gelu_mlp(
@@ -302,7 +380,7 @@ def _packed_gelu_mlp(
     master_weight_grads: bool,
 ) -> torch.Tensor:
     preact = _packed_linear(packed, fc1, hidden_states, master_weight_grads)
-    hidden = F.gelu(preact.float()).to(preact.dtype)
+    hidden = _packed_gelu(preact)
     return _packed_linear(packed, fc2, hidden, master_weight_grads)
 
 

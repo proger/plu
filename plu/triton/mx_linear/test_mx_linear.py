@@ -12,6 +12,8 @@ from plu.triton.mx_linear import (
     mxfp4_linear,
     mxfp4_linear_with_master_weight,
     mxfp8_linear,
+    mxfp8_linear_from_heads_with_master_weight,
+    mxfp8_linear_heads_with_master_weight,
     mxfp8_linear_with_master_weight,
     nvfp4_linear,
     nvfp4_linear_with_master_weight,
@@ -48,6 +50,105 @@ def test_mxfp8_e5m2_pack_and_linear_matches_bf16_reference():
 
     assert packed.dtype == torch.float8_e5m2
     assert _relative_l2(mxfp8_linear(x, packed, scales, in_features), F.linear(x, weight)) < 8.0e-2
+
+
+def test_mxfp8_linear_from_heads_with_master_weight_matches_merged_input():
+    torch.manual_seed(7)
+    batch = 2
+    heads = 4
+    seq_len = 5
+    head_dim = 16
+    out_features = 37
+    x_heads = torch.randn(batch, heads, seq_len, head_dim, device="cuda", dtype=torch.bfloat16, requires_grad=True)
+    x_merged = x_heads.detach().permute(0, 2, 1, 3).contiguous().reshape(batch, seq_len, heads * head_dim).requires_grad_()
+    master_weight = (torch.randn(out_features, heads * head_dim, device="cuda", dtype=torch.bfloat16) / math.sqrt(heads * head_dim)).requires_grad_()
+    merged_weight = master_weight.detach().clone().requires_grad_()
+    bias = torch.randn(out_features, device="cuda", dtype=torch.bfloat16, requires_grad=True)
+    merged_bias = bias.detach().clone().requires_grad_()
+    packed, scales, in_features = pack_mxfp8_weight(master_weight.detach())
+    input_grad_packed, input_grad_scales, input_grad_in_features = pack_mxfp8_weight(master_weight.detach().T.contiguous())
+
+    out = mxfp8_linear_from_heads_with_master_weight(
+        x_heads,
+        packed,
+        scales,
+        in_features,
+        master_weight,
+        bias,
+        input_grad_packed,
+        input_grad_scales,
+        input_grad_in_features,
+    )
+    ref = mxfp8_linear_with_master_weight(
+        x_merged,
+        packed,
+        scales,
+        in_features,
+        merged_weight,
+        merged_bias,
+        input_grad_packed,
+        input_grad_scales,
+        input_grad_in_features,
+    )
+    torch.testing.assert_close(out, ref, atol=0, rtol=0)
+
+    grad = torch.randn_like(out)
+    out.backward(grad)
+    ref.backward(grad)
+    expected_x_grad = x_merged.grad.reshape(batch, seq_len, heads, head_dim).permute(0, 2, 1, 3).contiguous()
+    torch.testing.assert_close(x_heads.grad, expected_x_grad, atol=0, rtol=0)
+    torch.testing.assert_close(master_weight.grad, merged_weight.grad, atol=0, rtol=0)
+    torch.testing.assert_close(bias.grad, merged_bias.grad, atol=0, rtol=0)
+
+
+def test_mxfp8_linear_heads_with_master_weight_matches_merged_output():
+    torch.manual_seed(8)
+    batch = 2
+    seq_len = 5
+    in_features = 31
+    heads = 4
+    head_dim = 16
+    out_features = heads * head_dim
+    x = torch.randn(batch, seq_len, in_features, device="cuda", dtype=torch.bfloat16, requires_grad=True)
+    merged_x = x.detach().clone().requires_grad_()
+    master_weight = (torch.randn(out_features, in_features, device="cuda", dtype=torch.bfloat16) / math.sqrt(in_features)).requires_grad_()
+    merged_weight = master_weight.detach().clone().requires_grad_()
+    bias = torch.randn(out_features, device="cuda", dtype=torch.bfloat16, requires_grad=True)
+    merged_bias = bias.detach().clone().requires_grad_()
+    packed, scales, packed_in_features = pack_mxfp8_weight(master_weight.detach())
+    input_grad_packed, input_grad_scales, input_grad_in_features = pack_mxfp8_weight(master_weight.detach().T.contiguous())
+
+    out = mxfp8_linear_heads_with_master_weight(
+        x,
+        packed,
+        scales,
+        packed_in_features,
+        heads,
+        master_weight,
+        bias,
+        input_grad_packed,
+        input_grad_scales,
+        input_grad_in_features,
+    )
+    ref = mxfp8_linear_with_master_weight(
+        merged_x,
+        packed,
+        scales,
+        packed_in_features,
+        merged_weight,
+        merged_bias,
+        input_grad_packed,
+        input_grad_scales,
+        input_grad_in_features,
+    ).reshape(batch, seq_len, heads, head_dim).permute(0, 2, 1, 3).contiguous()
+    torch.testing.assert_close(out, ref, atol=0, rtol=0)
+
+    grad = torch.randn_like(out)
+    out.backward(grad)
+    ref.backward(grad)
+    torch.testing.assert_close(x.grad, merged_x.grad, atol=0, rtol=0)
+    torch.testing.assert_close(master_weight.grad, merged_weight.grad, atol=0, rtol=0)
+    torch.testing.assert_close(bias.grad, merged_bias.grad, atol=4e-2, rtol=3e-1)
 
 
 def test_mxfp4_pack_layout():

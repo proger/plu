@@ -8,6 +8,22 @@ from torch import Tensor
 
 
 @triton.jit
+def _gelu_forward_kernel(
+    preact_ptr,
+    hidden_ptr,
+    total: tl.constexpr,
+    block_size: tl.constexpr,
+):
+    pid = tl.program_id(0)
+    offsets = pid * block_size + tl.arange(0, block_size)
+    mask = offsets < total
+    x = tl.load(preact_ptr + offsets, mask=mask, other=0.0).to(tl.float32)
+    inv_sqrt2 = 0.7071067690849304
+    hidden = x * 0.5 * (1.0 + libdevice.erf(x * inv_sqrt2))
+    tl.store(hidden_ptr + offsets, hidden, mask=mask)
+
+
+@triton.jit
 def _gelu_backward_kernel(
     preact_ptr,
     grad_hidden_ptr,
@@ -172,6 +188,21 @@ def gelu_backward(preact: Tensor, grad_hidden: Tensor) -> Tensor:
             num_warps=4,
         )
     return grad_preact
+
+
+def gelu_forward(preact: Tensor) -> Tensor:
+    hidden = torch.empty_like(preact)
+    total = preact.numel()
+    if total:
+        block_size = 256
+        _gelu_forward_kernel[(triton.cdiv(total, block_size),)](
+            preact,
+            hidden,
+            total,
+            block_size,
+            num_warps=4,
+        )
+    return hidden
 
 
 def linear_input_gelu_grad(grad_out: Tensor, weight: Tensor, preact: Tensor) -> Tensor:

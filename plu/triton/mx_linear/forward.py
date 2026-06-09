@@ -7,7 +7,7 @@ import triton
 import triton.language as tl
 from torch import Tensor
 
-from plu.triton.linear.backward import linear_weight_bias_grad
+from plu.triton.linear.backward import linear_weight_bias_grad, linear_weight_bias_grad_heads_grad, linear_weight_bias_grad_heads_input
 
 
 MXFP_BLOCK_SIZE = 32
@@ -203,6 +203,14 @@ def _mxfp8_linear_kernel(
     grid_m: tl.constexpr,
     grid_n: tl.constexpr,
     group_m: tl.constexpr,
+    load_heads: tl.constexpr,
+    load_seq_len: tl.constexpr,
+    load_num_heads: tl.constexpr,
+    load_head_dim: tl.constexpr,
+    store_heads: tl.constexpr,
+    seq_len: tl.constexpr,
+    num_heads: tl.constexpr,
+    head_dim_out: tl.constexpr,
 ):
     pid_m, pid_n = _grouped_pids(tl.program_id(0), grid_m, grid_n, group_m)
     offs_m = pid_m * block_m + tl.arange(0, block_m)
@@ -212,11 +220,26 @@ def _mxfp8_linear_kernel(
 
     for scale_group in tl.range(0, tl.cdiv(scale_blocks, 4)):
         k = scale_group * 128 + offs_k
-        x = tl.load(
-            x_ptr + offs_m[:, None] * in_features + k[None, :],
-            mask=(offs_m[:, None] < rows) & (k[None, :] < in_features),
-            other=0.0,
-        )
+        if load_heads:
+            batch_offsets = offs_m // load_seq_len
+            time_offsets = offs_m - batch_offsets * load_seq_len
+            head_offsets = k // load_head_dim
+            dim_offsets = k - head_offsets * load_head_dim
+            x_offsets = (
+                (batch_offsets[:, None] * load_num_heads + head_offsets[None, :]) * load_seq_len
+                + time_offsets[:, None]
+            ) * load_head_dim + dim_offsets[None, :]
+            x = tl.load(
+                x_ptr + x_offsets,
+                mask=(offs_m[:, None] < rows) & (k[None, :] < in_features),
+                other=0.0,
+            )
+        else:
+            x = tl.load(
+                x_ptr + offs_m[:, None] * in_features + k[None, :],
+                mask=(offs_m[:, None] < rows) & (k[None, :] < in_features),
+                other=0.0,
+            )
         x_scaled = x.to(tl.bfloat16)
         weight_t = tl.load(
             weight_ptr + offs_n[None, :] * padded_in_features + k[:, None],
@@ -239,11 +262,19 @@ def _mxfp8_linear_kernel(
     if has_bias:
         bias = tl.load(bias_ptr + offs_n, mask=offs_n < out_features, other=0.0).to(tl.float32)
         acc += bias[None, :]
-    tl.store(
-        out_ptr + offs_m[:, None] * out_features + offs_n[None, :],
-        acc,
-        mask=(offs_m[:, None] < rows) & (offs_n[None, :] < out_features),
-    )
+    mask = (offs_m[:, None] < rows) & (offs_n[None, :] < out_features)
+    if store_heads:
+        batch_offsets = offs_m // seq_len
+        time_offsets = offs_m - batch_offsets * seq_len
+        head_offsets = offs_n // head_dim_out
+        dim_offsets = offs_n - head_offsets * head_dim_out
+        out_offsets = (
+            (batch_offsets[:, None] * num_heads + head_offsets[None, :]) * seq_len
+            + time_offsets[:, None]
+        ) * head_dim_out + dim_offsets[None, :]
+        tl.store(out_ptr + out_offsets, acc, mask=mask)
+    else:
+        tl.store(out_ptr + offs_m[:, None] * out_features + offs_n[None, :], acc, mask=mask)
 
 
 @triton.jit
@@ -552,7 +583,7 @@ def mxfp8_linear_2d(
     use_large_tiles = rows >= 128 and in_features >= 512 and out_features >= 512
     input_format = _dot_scaled_input_format(x_2d, "mxfp8_linear")
     weight_format = "e5m2" if packed_weight.dtype == torch.float8_e5m2 else "e4m3"
-    block_m = 64 if use_large_tiles else 16
+    block_m = 32 if use_large_tiles else 16
     block_n = 128
     grid_m = triton.cdiv(rows, block_m)
     grid_n = triton.cdiv(out_features, block_n)
@@ -577,6 +608,147 @@ def mxfp8_linear_2d(
         grid_m,
         grid_n,
         group_m,
+        False,
+        0,
+        0,
+        0,
+        False,
+        0,
+        0,
+        0,
+        num_warps=4,
+    )
+    return out
+
+
+def mxfp8_linear_heads_2d(
+    x_2d: Tensor,
+    packed_weight: Tensor,
+    scale_codes: Tensor,
+    in_features: int,
+    batch: int,
+    seq_len: int,
+    num_heads: int,
+    head_dim: int,
+    bias: Tensor | None = None,
+    out_dtype: torch.dtype | None = None,
+) -> Tensor:
+    if x_2d.shape[0] != batch * seq_len:
+        raise ValueError(f"x rows {x_2d.shape[0]} must equal batch * seq_len {batch * seq_len}")
+    rows, in_features, padded_in, out_features, scale_blocks, scale_k_groups = _check_packed_shapes(
+        x_2d,
+        packed_weight,
+        scale_codes,
+        in_features,
+        packed_values_per_byte=1,
+    )
+    if out_features != num_heads * head_dim:
+        raise ValueError(f"out features {out_features} must equal num_heads * head_dim {num_heads * head_dim}")
+    out = torch.empty((batch, num_heads, seq_len, head_dim), device=x_2d.device, dtype=x_2d.dtype if out_dtype is None else out_dtype)
+    if rows == 0:
+        return out
+    use_large_tiles = rows >= 128 and in_features >= 512 and out_features >= 512
+    input_format = _dot_scaled_input_format(x_2d, "mxfp8_linear_heads")
+    weight_format = "e5m2" if packed_weight.dtype == torch.float8_e5m2 else "e4m3"
+    block_m = 32 if use_large_tiles else 16
+    block_n = 128
+    grid_m = triton.cdiv(rows, block_m)
+    grid_n = triton.cdiv(out_features, block_n)
+    group_m = 8 if use_large_tiles else 4
+    _mxfp8_linear_kernel[(grid_m * grid_n,)](
+        x_2d,
+        packed_weight,
+        scale_codes,
+        bias if bias is not None else x_2d,
+        out,
+        rows,
+        in_features,
+        padded_in,
+        out_features,
+        scale_blocks,
+        scale_k_groups,
+        bias is not None,
+        input_format,
+        weight_format,
+        block_m,
+        block_n,
+        grid_m,
+        grid_n,
+        group_m,
+        False,
+        0,
+        0,
+        0,
+        True,
+        seq_len,
+        num_heads,
+        head_dim,
+        num_warps=4,
+    )
+    return out
+
+
+def mxfp8_linear_from_heads_2d(
+    x_heads: Tensor,
+    packed_weight: Tensor,
+    scale_codes: Tensor,
+    in_features: int,
+    bias: Tensor | None = None,
+    out_dtype: torch.dtype | None = None,
+) -> Tensor:
+    if not x_heads.is_cuda:
+        raise RuntimeError("mxfp8_linear_from_heads requires CUDA tensors")
+    if x_heads.ndim != 4:
+        raise ValueError("x_heads must have shape [batch, heads, seq_len, head_dim]")
+    batch, num_heads, seq_len, head_dim = x_heads.shape
+    if in_features != num_heads * head_dim:
+        raise ValueError(f"in features {in_features} must equal num_heads * head_dim {num_heads * head_dim}")
+    rows = batch * seq_len
+    if packed_weight.ndim != 2:
+        raise ValueError("packed_weight must be 2D")
+    out_features = packed_weight.shape[0]
+    padded_in = packed_weight.shape[1]
+    scale_blocks = triton.cdiv(padded_in, MXFP_BLOCK_SIZE)
+    scale_k_groups = _check_blackwell_scale_shape(scale_codes, out_features, scale_blocks)
+    out = torch.empty((batch, seq_len, out_features), device=x_heads.device, dtype=x_heads.dtype if out_dtype is None else out_dtype)
+    if rows == 0:
+        return out
+    use_large_tiles = rows >= 128 and in_features >= 512 and out_features >= 512
+    input_format = _dot_scaled_input_format(x_heads, "mxfp8_linear_from_heads")
+    weight_format = "e5m2" if packed_weight.dtype == torch.float8_e5m2 else "e4m3"
+    block_m = 32 if use_large_tiles else 16
+    block_n = 128
+    grid_m = triton.cdiv(rows, block_m)
+    grid_n = triton.cdiv(out_features, block_n)
+    group_m = 8 if use_large_tiles else 4
+    _mxfp8_linear_kernel[(grid_m * grid_n,)](
+        x_heads,
+        packed_weight,
+        scale_codes,
+        bias if bias is not None else x_heads,
+        out,
+        rows,
+        in_features,
+        padded_in,
+        out_features,
+        scale_blocks,
+        scale_k_groups,
+        bias is not None,
+        input_format,
+        weight_format,
+        block_m,
+        block_n,
+        grid_m,
+        grid_n,
+        group_m,
+        True,
+        seq_len,
+        num_heads,
+        head_dim,
+        False,
+        0,
+        0,
+        0,
         num_warps=4,
     )
     return out
@@ -604,7 +776,7 @@ def mxfp4_linear_2d(
         return out
     use_large_tiles = rows >= 128 and in_features >= 512 and out_features >= 512
     input_format = _dot_scaled_input_format(x_2d, "mxfp4_linear")
-    block_m = 64 if use_large_tiles else 16
+    block_m = 32 if use_large_tiles else 16
     block_n = 128
     grid_m = triton.cdiv(rows, block_m)
     grid_n = triton.cdiv(out_features, block_n)
@@ -896,6 +1068,280 @@ class _MXFP8LinearWithMasterWeight(torch.autograd.Function):
         return grad_x, None, None, None, grad_weight, grad_bias, None, None, None
 
 
+class _MXFP8LinearHeads(torch.autograd.Function):
+    @staticmethod
+    def forward(
+        ctx,
+        x: Tensor,
+        packed_weight: Tensor,
+        scale_codes: Tensor,
+        in_features: int,
+        num_heads: int,
+        bias: Tensor | None,
+        input_grad_packed_weight: Tensor | None,
+        input_grad_scale_codes: Tensor | None,
+        input_grad_in_features: int | None,
+    ):
+        original_shape = x.shape
+        if len(original_shape) != 3:
+            raise ValueError("mxfp8_linear_heads expects [batch, seq_len, features] input")
+        batch, seq_len, _ = original_shape
+        x_2d = x.contiguous().reshape(-1, original_shape[-1])
+        packed_weight = packed_weight.contiguous()
+        scale_codes = scale_codes.contiguous()
+        bias = None if bias is None else bias.contiguous()
+        out_features = packed_weight.shape[0]
+        head_dim = out_features // num_heads
+        has_input_grad_pack = input_grad_packed_weight is not None
+        if out_features != num_heads * head_dim:
+            raise ValueError(f"out features {out_features} must be divisible by num_heads {num_heads}")
+        if x.requires_grad and (input_grad_packed_weight is None or input_grad_scale_codes is None or input_grad_in_features is None):
+            raise RuntimeError("mxfp8_linear_heads backward requires packed transposed weight")
+        if input_grad_packed_weight is not None:
+            input_grad_packed_weight = input_grad_packed_weight.contiguous()
+            input_grad_scale_codes = input_grad_scale_codes.contiguous()
+        out = mxfp8_linear_heads_2d(x_2d, packed_weight, scale_codes, in_features, batch, seq_len, num_heads, head_dim, bias)
+        if has_input_grad_pack:
+            ctx.save_for_backward(input_grad_packed_weight, input_grad_scale_codes)
+        else:
+            ctx.save_for_backward()
+        ctx.input_grad_in_features = input_grad_in_features
+        ctx.has_input_grad_pack = has_input_grad_pack
+        ctx.original_shape = original_shape
+        ctx.input_dtype = x.dtype
+        ctx.out_features = out_features
+        return out
+
+    @staticmethod
+    def backward(ctx, grad_out: Tensor):
+        grad_x = None
+        if ctx.needs_input_grad[0]:
+            if not ctx.has_input_grad_pack:
+                raise RuntimeError("mxfp8_linear_heads backward requires packed transposed weight")
+            input_grad_packed_weight, input_grad_scale_codes = ctx.saved_tensors
+            grad_x = mxfp8_linear_from_heads_2d(
+                grad_out,
+                input_grad_packed_weight,
+                input_grad_scale_codes,
+                ctx.input_grad_in_features,
+                None,
+                ctx.input_dtype,
+            ).reshape(ctx.original_shape)
+        if ctx.needs_input_grad[5]:
+            grad_out_2d = grad_out.permute(0, 2, 1, 3).contiguous().reshape(-1, ctx.out_features)
+            grad_bias = mx_linear_bias_grad_2d(grad_out_2d, ctx.out_features, grad_out.dtype)
+        else:
+            grad_bias = None
+        return grad_x, None, None, None, None, grad_bias, None, None, None
+
+
+class _MXFP8LinearHeadsWithMasterWeight(torch.autograd.Function):
+    @staticmethod
+    def forward(
+        ctx,
+        x: Tensor,
+        packed_weight: Tensor,
+        scale_codes: Tensor,
+        in_features: int,
+        num_heads: int,
+        master_weight: Tensor,
+        bias: Tensor | None,
+        input_grad_packed_weight: Tensor | None,
+        input_grad_scale_codes: Tensor | None,
+        input_grad_in_features: int | None,
+    ):
+        original_shape = x.shape
+        if len(original_shape) != 3:
+            raise ValueError("mxfp8_linear_heads_with_master_weight expects [batch, seq_len, features] input")
+        batch, seq_len, _ = original_shape
+        x_2d = x.contiguous().reshape(-1, original_shape[-1])
+        packed_weight = packed_weight.contiguous()
+        scale_codes = scale_codes.contiguous()
+        bias = None if bias is None else bias.contiguous()
+        out_features = packed_weight.shape[0]
+        head_dim = out_features // num_heads
+        has_input_grad_pack = input_grad_packed_weight is not None
+        if out_features != num_heads * head_dim:
+            raise ValueError(f"out features {out_features} must be divisible by num_heads {num_heads}")
+        if x.requires_grad and (input_grad_packed_weight is None or input_grad_scale_codes is None or input_grad_in_features is None):
+            raise RuntimeError("mxfp8_linear_heads_with_master_weight backward requires packed transposed weight")
+        if input_grad_packed_weight is not None:
+            input_grad_packed_weight = input_grad_packed_weight.contiguous()
+            input_grad_scale_codes = input_grad_scale_codes.contiguous()
+        out = mxfp8_linear_heads_2d(x_2d, packed_weight, scale_codes, in_features, batch, seq_len, num_heads, head_dim, bias)
+        if has_input_grad_pack:
+            ctx.save_for_backward(x_2d, input_grad_packed_weight, input_grad_scale_codes)
+        else:
+            ctx.save_for_backward(x_2d)
+        ctx.input_grad_in_features = input_grad_in_features
+        ctx.has_input_grad_pack = has_input_grad_pack
+        ctx.has_bias = bias is not None
+        ctx.original_shape = original_shape
+        ctx.input_dtype = x.dtype
+        ctx.master_weight_dtype = master_weight.dtype
+        ctx.out_features = out_features
+        return out
+
+    @staticmethod
+    def backward(ctx, grad_out: Tensor):
+        saved = ctx.saved_tensors
+        x_2d = saved[0]
+        grad_x = None
+        if ctx.needs_input_grad[0]:
+            if not ctx.has_input_grad_pack:
+                raise RuntimeError("mxfp8_linear_heads_with_master_weight backward requires packed transposed weight")
+            input_grad_packed_weight, input_grad_scale_codes = saved[1], saved[2]
+            grad_x = mxfp8_linear_from_heads_2d(
+                grad_out,
+                input_grad_packed_weight,
+                input_grad_scale_codes,
+                ctx.input_grad_in_features,
+                None,
+                ctx.input_dtype,
+            ).reshape(ctx.original_shape)
+        grad_weight, grad_bias = linear_weight_bias_grad_heads_grad(grad_out, x_2d, ctx.has_bias, dtype=ctx.master_weight_dtype)
+        if grad_bias is not None and grad_bias.dtype != grad_out.dtype:
+            grad_bias = grad_bias.to(grad_out.dtype)
+        return grad_x, None, None, None, None, grad_weight, grad_bias, None, None, None
+
+
+class _MXFP8LinearFromHeads(torch.autograd.Function):
+    @staticmethod
+    def forward(
+        ctx,
+        x_heads: Tensor,
+        packed_weight: Tensor,
+        scale_codes: Tensor,
+        in_features: int,
+        bias: Tensor | None,
+        input_grad_packed_weight: Tensor | None,
+        input_grad_scale_codes: Tensor | None,
+        input_grad_in_features: int | None,
+    ):
+        if x_heads.ndim != 4:
+            raise ValueError("mxfp8_linear_from_heads expects [batch, heads, seq_len, head_dim] input")
+        batch, num_heads, seq_len, head_dim = x_heads.shape
+        packed_weight = packed_weight.contiguous()
+        scale_codes = scale_codes.contiguous()
+        bias = None if bias is None else bias.contiguous()
+        out_features = packed_weight.shape[0]
+        has_input_grad_pack = input_grad_packed_weight is not None
+        if x_heads.requires_grad and (input_grad_packed_weight is None or input_grad_scale_codes is None or input_grad_in_features is None):
+            raise RuntimeError("mxfp8_linear_from_heads backward requires packed transposed weight")
+        if input_grad_packed_weight is not None:
+            input_grad_packed_weight = input_grad_packed_weight.contiguous()
+            input_grad_scale_codes = input_grad_scale_codes.contiguous()
+        out = mxfp8_linear_from_heads_2d(x_heads, packed_weight, scale_codes, in_features, bias)
+        if has_input_grad_pack:
+            ctx.save_for_backward(input_grad_packed_weight, input_grad_scale_codes)
+        else:
+            ctx.save_for_backward()
+        ctx.input_grad_in_features = input_grad_in_features
+        ctx.has_input_grad_pack = has_input_grad_pack
+        ctx.has_bias = bias is not None
+        ctx.batch = batch
+        ctx.num_heads = num_heads
+        ctx.seq_len = seq_len
+        ctx.head_dim = head_dim
+        ctx.input_dtype = x_heads.dtype
+        ctx.out_features = out_features
+        return out
+
+    @staticmethod
+    def backward(ctx, grad_out: Tensor):
+        grad_out_2d = grad_out.contiguous().reshape(-1, ctx.out_features)
+        grad_x = None
+        if ctx.needs_input_grad[0]:
+            if not ctx.has_input_grad_pack:
+                raise RuntimeError("mxfp8_linear_from_heads backward requires packed transposed weight")
+            input_grad_packed_weight, input_grad_scale_codes = ctx.saved_tensors
+            grad_x = mxfp8_linear_heads_2d(
+                grad_out_2d,
+                input_grad_packed_weight,
+                input_grad_scale_codes,
+                ctx.input_grad_in_features,
+                ctx.batch,
+                ctx.seq_len,
+                ctx.num_heads,
+                ctx.head_dim,
+                None,
+                ctx.input_dtype,
+            )
+        grad_bias = mx_linear_bias_grad_2d(grad_out_2d, ctx.out_features, grad_out.dtype) if ctx.has_bias else None
+        return grad_x, None, None, None, grad_bias, None, None, None
+
+
+class _MXFP8LinearFromHeadsWithMasterWeight(torch.autograd.Function):
+    @staticmethod
+    def forward(
+        ctx,
+        x_heads: Tensor,
+        packed_weight: Tensor,
+        scale_codes: Tensor,
+        in_features: int,
+        master_weight: Tensor,
+        bias: Tensor | None,
+        input_grad_packed_weight: Tensor | None,
+        input_grad_scale_codes: Tensor | None,
+        input_grad_in_features: int | None,
+    ):
+        if x_heads.ndim != 4:
+            raise ValueError("mxfp8_linear_from_heads_with_master_weight expects [batch, heads, seq_len, head_dim] input")
+        batch, num_heads, seq_len, head_dim = x_heads.shape
+        packed_weight = packed_weight.contiguous()
+        scale_codes = scale_codes.contiguous()
+        bias = None if bias is None else bias.contiguous()
+        out_features = packed_weight.shape[0]
+        has_input_grad_pack = input_grad_packed_weight is not None
+        if x_heads.requires_grad and (input_grad_packed_weight is None or input_grad_scale_codes is None or input_grad_in_features is None):
+            raise RuntimeError("mxfp8_linear_from_heads_with_master_weight backward requires packed transposed weight")
+        if input_grad_packed_weight is not None:
+            input_grad_packed_weight = input_grad_packed_weight.contiguous()
+            input_grad_scale_codes = input_grad_scale_codes.contiguous()
+        out = mxfp8_linear_from_heads_2d(x_heads, packed_weight, scale_codes, in_features, bias)
+        if has_input_grad_pack:
+            ctx.save_for_backward(x_heads, input_grad_packed_weight, input_grad_scale_codes)
+        else:
+            ctx.save_for_backward(x_heads)
+        ctx.input_grad_in_features = input_grad_in_features
+        ctx.has_input_grad_pack = has_input_grad_pack
+        ctx.has_bias = bias is not None
+        ctx.batch = batch
+        ctx.num_heads = num_heads
+        ctx.seq_len = seq_len
+        ctx.head_dim = head_dim
+        ctx.input_dtype = x_heads.dtype
+        ctx.master_weight_dtype = master_weight.dtype
+        ctx.out_features = out_features
+        return out
+
+    @staticmethod
+    def backward(ctx, grad_out: Tensor):
+        saved = ctx.saved_tensors
+        x_heads = saved[0]
+        grad_out_2d = grad_out.contiguous().reshape(-1, ctx.out_features)
+        grad_x = None
+        if ctx.needs_input_grad[0]:
+            if not ctx.has_input_grad_pack:
+                raise RuntimeError("mxfp8_linear_from_heads_with_master_weight backward requires packed transposed weight")
+            input_grad_packed_weight, input_grad_scale_codes = saved[1], saved[2]
+            grad_x = mxfp8_linear_heads_2d(
+                grad_out_2d,
+                input_grad_packed_weight,
+                input_grad_scale_codes,
+                ctx.input_grad_in_features,
+                ctx.batch,
+                ctx.seq_len,
+                ctx.num_heads,
+                ctx.head_dim,
+                None,
+                ctx.input_dtype,
+            )
+        grad_weight, _ = linear_weight_bias_grad_heads_input(grad_out_2d, x_heads, False, dtype=ctx.master_weight_dtype)
+        grad_bias = mx_linear_bias_grad_2d(grad_out_2d, ctx.out_features, grad_out.dtype) if ctx.has_bias else None
+        return grad_x, None, None, None, grad_weight, grad_bias, None, None, None
+
+
 class _MXFP4Linear(torch.autograd.Function):
     @staticmethod
     def forward(
@@ -1162,6 +1608,52 @@ def mxfp8_linear(
     )
 
 
+def mxfp8_linear_heads(
+    x: Tensor,
+    packed_weight: Tensor,
+    scale_codes: Tensor,
+    in_features: int,
+    num_heads: int,
+    bias: Tensor | None = None,
+    input_grad_packed_weight: Tensor | None = None,
+    input_grad_scale_codes: Tensor | None = None,
+    input_grad_in_features: int | None = None,
+) -> Tensor:
+    return _MXFP8LinearHeads.apply(
+        x,
+        packed_weight,
+        scale_codes,
+        in_features,
+        num_heads,
+        bias,
+        input_grad_packed_weight,
+        input_grad_scale_codes,
+        input_grad_in_features,
+    )
+
+
+def mxfp8_linear_from_heads(
+    x_heads: Tensor,
+    packed_weight: Tensor,
+    scale_codes: Tensor,
+    in_features: int,
+    bias: Tensor | None = None,
+    input_grad_packed_weight: Tensor | None = None,
+    input_grad_scale_codes: Tensor | None = None,
+    input_grad_in_features: int | None = None,
+) -> Tensor:
+    return _MXFP8LinearFromHeads.apply(
+        x_heads,
+        packed_weight,
+        scale_codes,
+        in_features,
+        bias,
+        input_grad_packed_weight,
+        input_grad_scale_codes,
+        input_grad_in_features,
+    )
+
+
 def mxfp4_linear(
     x: Tensor,
     packed_weight: Tensor,
@@ -1219,6 +1711,56 @@ def mxfp8_linear_with_master_weight(
 ) -> Tensor:
     return _MXFP8LinearWithMasterWeight.apply(
         x,
+        packed_weight,
+        scale_codes,
+        in_features,
+        master_weight,
+        bias,
+        input_grad_packed_weight,
+        input_grad_scale_codes,
+        input_grad_in_features,
+    )
+
+
+def mxfp8_linear_heads_with_master_weight(
+    x: Tensor,
+    packed_weight: Tensor,
+    scale_codes: Tensor,
+    in_features: int,
+    num_heads: int,
+    master_weight: Tensor,
+    bias: Tensor | None = None,
+    input_grad_packed_weight: Tensor | None = None,
+    input_grad_scale_codes: Tensor | None = None,
+    input_grad_in_features: int | None = None,
+) -> Tensor:
+    return _MXFP8LinearHeadsWithMasterWeight.apply(
+        x,
+        packed_weight,
+        scale_codes,
+        in_features,
+        num_heads,
+        master_weight,
+        bias,
+        input_grad_packed_weight,
+        input_grad_scale_codes,
+        input_grad_in_features,
+    )
+
+
+def mxfp8_linear_from_heads_with_master_weight(
+    x_heads: Tensor,
+    packed_weight: Tensor,
+    scale_codes: Tensor,
+    in_features: int,
+    master_weight: Tensor,
+    bias: Tensor | None = None,
+    input_grad_packed_weight: Tensor | None = None,
+    input_grad_scale_codes: Tensor | None = None,
+    input_grad_in_features: int | None = None,
+) -> Tensor:
+    return _MXFP8LinearFromHeadsWithMasterWeight.apply(
+        x_heads,
         packed_weight,
         scale_codes,
         in_features,

@@ -15,9 +15,22 @@ def _flash_attention_forward_kernel(
     value_ptr,
     out_ptr,
     lse_ptr,
+    heads: tl.constexpr,
     query_len: tl.constexpr,
     key_len: tl.constexpr,
     head_dim: tl.constexpr,
+    q_stride_b: tl.constexpr,
+    q_stride_h: tl.constexpr,
+    q_stride_m: tl.constexpr,
+    q_stride_d: tl.constexpr,
+    k_stride_b: tl.constexpr,
+    k_stride_h: tl.constexpr,
+    k_stride_n: tl.constexpr,
+    k_stride_d: tl.constexpr,
+    v_stride_b: tl.constexpr,
+    v_stride_h: tl.constexpr,
+    v_stride_n: tl.constexpr,
+    v_stride_d: tl.constexpr,
     scale: tl.constexpr,
     causal: tl.constexpr,
     use_bf16_dot: tl.constexpr,
@@ -26,15 +39,19 @@ def _flash_attention_forward_kernel(
     block_d: tl.constexpr,
 ):
     pid_bh = tl.program_id(0)
+    pid_b = pid_bh // heads
+    pid_h = pid_bh - pid_b * heads
     pid_m = tl.program_id(1)
     offs_m = pid_m * block_m + tl.arange(0, block_m)
     offs_n = tl.arange(0, block_n)
     offs_d = tl.arange(0, block_d)
-    q_base = pid_bh * query_len * head_dim
-    k_base = pid_bh * key_len * head_dim
+    q_base = pid_b * q_stride_b + pid_h * q_stride_h
+    k_base = pid_b * k_stride_b + pid_h * k_stride_h
+    v_base = pid_b * v_stride_b + pid_h * v_stride_h
+    out_base = pid_bh * query_len * head_dim
 
     query = tl.load(
-        query_ptr + q_base + offs_m[:, None] * head_dim + offs_d[None, :],
+        query_ptr + q_base + offs_m[:, None] * q_stride_m + offs_d[None, :] * q_stride_d,
         mask=(offs_m[:, None] < query_len) & (offs_d[None, :] < head_dim),
         other=0.0,
     )
@@ -45,7 +62,7 @@ def _flash_attention_forward_kernel(
     for n_start in tl.range(0, key_len, block_n):
         n = n_start + offs_n
         key = tl.load(
-            key_ptr + k_base + n[:, None] * head_dim + offs_d[None, :],
+            key_ptr + k_base + n[:, None] * k_stride_n + offs_d[None, :] * k_stride_d,
             mask=(n[:, None] < key_len) & (offs_d[None, :] < head_dim),
             other=0.0,
         )
@@ -64,7 +81,7 @@ def _flash_attention_forward_kernel(
             probs = tl.where(offs_m[:, None] >= n[None, :], probs, 0.0)
 
         value = tl.load(
-            value_ptr + k_base + n[:, None] * head_dim + offs_d[None, :],
+            value_ptr + v_base + n[:, None] * v_stride_n + offs_d[None, :] * v_stride_d,
             mask=(n[:, None] < key_len) & (offs_d[None, :] < head_dim),
             other=0.0,
         )
@@ -77,7 +94,7 @@ def _flash_attention_forward_kernel(
 
     out = acc / row_sum[:, None]
     lse = row_max + tl.log(row_sum)
-    out_offsets = q_base + offs_m[:, None] * head_dim + offs_d[None, :]
+    out_offsets = out_base + offs_m[:, None] * head_dim + offs_d[None, :]
     mask = (offs_m[:, None] < query_len) & (offs_d[None, :] < head_dim)
     tl.store(out_ptr + out_offsets, out, mask=mask)
     tl.store(lse_ptr + pid_bh * query_len + offs_m, lse, mask=offs_m < query_len)
@@ -87,26 +104,36 @@ def _flash_attention_forward(query: Tensor, key: Tensor, value: Tensor, causal: 
     batch, heads, query_len, head_dim = query.shape
     key_len = key.shape[2]
     batch_heads = batch * heads
-    query_2d = query.reshape(batch_heads, query_len, head_dim)
-    key_2d = key.reshape(batch_heads, key_len, head_dim)
-    value_2d = value.reshape(batch_heads, key_len, head_dim)
-    out = torch.empty_like(query_2d)
+    out = torch.empty((batch_heads, query_len, head_dim), device=query.device, dtype=query.dtype)
     lse = torch.empty((batch_heads, query_len), device=query.device, dtype=torch.float32)
     if batch_heads == 0 or query_len == 0:
         return out.reshape_as(query), lse
 
-    block_m = 32
+    block_m = 64
     block_n = 32
     block_d = max(16, triton.next_power_of_2(head_dim))
     _flash_attention_forward_kernel[(batch_heads, triton.cdiv(query_len, block_m))](
-        query_2d,
-        key_2d,
-        value_2d,
+        query,
+        key,
+        value,
         out,
         lse,
+        heads,
         query_len,
         key_len,
         head_dim,
+        query.stride(0),
+        query.stride(1),
+        query.stride(2),
+        query.stride(3),
+        key.stride(0),
+        key.stride(1),
+        key.stride(2),
+        key.stride(3),
+        value.stride(0),
+        value.stride(1),
+        value.stride(2),
+        value.stride(3),
         head_dim**-0.5,
         causal,
         query.dtype is torch.bfloat16,
@@ -121,9 +148,6 @@ def _flash_attention_forward(query: Tensor, key: Tensor, value: Tensor, causal: 
 class _TritonFlashAttention(torch.autograd.Function):
     @staticmethod
     def forward(ctx, query: Tensor, key: Tensor, value: Tensor, causal: bool):
-        query = query.contiguous()
-        key = key.contiguous()
-        value = value.contiguous()
         out, lse = _flash_attention_forward(query, key, value, causal)
         ctx.save_for_backward(query, key, value, out, lse)
         ctx.causal = causal

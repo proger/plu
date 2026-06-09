@@ -54,3 +54,26 @@ def test_flash_attention_bf16_forward_backward(causal):
     triton_out.backward(grad)
     for ref_arg, triton_arg in zip((query, key, value), triton_args):
         torch.testing.assert_close(triton_arg.grad, ref_arg.grad, atol=6e-2, rtol=6e-2)
+
+
+def test_flash_attention_bf16_non_contiguous_qkv_matches_contiguous():
+    torch.manual_seed(0)
+    batch, heads, seq_len, head_dim = 1, 4, 7, 16
+    query_base = torch.randn(batch, seq_len, heads, head_dim, device="cuda", dtype=torch.bfloat16)
+    key_base = torch.randn(batch, seq_len, heads, head_dim, device="cuda", dtype=torch.bfloat16)
+    value_base = torch.randn(batch, seq_len, heads, head_dim, device="cuda", dtype=torch.bfloat16)
+    query = query_base.permute(0, 2, 1, 3).requires_grad_()
+    key = key_base.permute(0, 2, 1, 3).requires_grad_()
+    value = value_base.permute(0, 2, 1, 3).requires_grad_()
+    query_contiguous, key_contiguous, value_contiguous = _clone_args(query.contiguous(), key.contiguous(), value.contiguous())
+
+    out = triton_flash_attention(query, key, value)
+    expected = triton_flash_attention(query_contiguous, key_contiguous, value_contiguous)
+    torch.testing.assert_close(out, expected, atol=0, rtol=0)
+
+    grad = torch.randn_like(out)
+    out.backward(grad)
+    expected.backward(grad)
+    torch.testing.assert_close(query.grad, query_contiguous.grad, atol=0, rtol=0)
+    torch.testing.assert_close(key.grad, key_contiguous.grad, atol=0, rtol=0)
+    torch.testing.assert_close(value.grad, value_contiguous.grad, atol=0, rtol=0)

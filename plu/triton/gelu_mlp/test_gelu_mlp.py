@@ -10,7 +10,7 @@ import torch.nn.functional as F
 pytest.importorskip("triton")
 
 from plu.ref.gelu_mlp import gelu_mlp as ref_gelu_mlp
-from plu.triton.gelu_mlp.backward import linear_input_gelu_grad
+from plu.triton.gelu_mlp.backward import gelu_forward, linear_input_gelu_grad
 from plu.triton.gelu_mlp.forward import _gelu_mlp_forward
 from plu.triton.gelu_mlp import gelu_mlp as triton_gelu_mlp
 
@@ -50,6 +50,14 @@ def _assert_grads_close(ref_args, triton_args, names, atol=5e-5, rtol=5e-5, tole
         if torch.is_tensor(ref_arg) and ref_arg.requires_grad:
             grad_atol, grad_rtol = tolerances.get(name, (atol, rtol)) if tolerances else (atol, rtol)
             torch.testing.assert_close(ref_arg.grad, triton_arg.grad, atol=grad_atol, rtol=grad_rtol, msg=name)
+
+
+def test_gelu_forward_bf16_matches_high_precision_reference():
+    torch.manual_seed(0)
+    x = torch.randn(3, 257, device="cuda", dtype=torch.bfloat16)
+    actual = gelu_forward(x)
+    expected = F.gelu(x.float()).to(torch.bfloat16)
+    torch.testing.assert_close(actual, expected, atol=2e-5, rtol=2e-5)
 
 
 def test_gelu_mlp_forward_backward():
