@@ -104,7 +104,7 @@ def _layer_norm_parameter_dtypes(model: torch.nn.Module) -> list[str]:
 
 
 def _pack_frozen_encoder_layers(model: torch.nn.Module, frozen_layers: int):
-    from benchmarks.bench_end_to_end import pack_mx_linear
+    from plu.benchmarks.bench_end_to_end import pack_mx_linear
 
     packed = {}
     for layer in model.model.encoder.layers[:frozen_layers]:
@@ -121,7 +121,7 @@ def _limited_forward(
     *,
     frozen_encoder_mxfp8: bool,
 ):
-    from benchmarks.bench_end_to_end import _packed_encoder_layer, encoder_backward_start
+    from plu.benchmarks.bench_end_to_end import _packed_encoder_layer, encoder_backward_start
     from plu.whisper import Seq2SeqOutput, cross_entropy, encoder_position_embedding, shift_tokens_right
 
     encoder = model.model.encoder

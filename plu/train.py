@@ -153,7 +153,7 @@ def trainable_parameter_summary(model: torch.nn.Module) -> str:
 
 
 def pack_mxfp8_linears(model: WhisperForConditionalGeneration) -> tuple[dict[int, Any], dict[str, Any]]:
-    from benchmarks.bench_end_to_end import pack_mx_model
+    from plu.benchmarks.bench_end_to_end import pack_mx_model
 
     return pack_mx_model(model, "mxfp8")
 
@@ -167,7 +167,7 @@ def accelerated_forward(
     frozen_encoder_linears: dict[int, Any],
 ) -> Seq2SeqOutput:
     if frozen_encoder_linear_format == "mxfp8":
-        from benchmarks.bench_end_to_end import packed_mx_forward
+        from plu.benchmarks.bench_end_to_end import packed_mx_forward
 
         return packed_mx_forward(
             model,

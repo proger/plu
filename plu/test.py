@@ -331,7 +331,7 @@ class Mxfp8KvCacheCudaGraphSampler:
         return cached
 
     def _project_heads(self, module: torch.nn.Module, hidden_states: torch.Tensor) -> torch.Tensor:
-        from benchmarks.bench_end_to_end import _packed_linear
+        from plu.benchmarks.bench_end_to_end import _packed_linear
 
         projected = _packed_linear(self.packed, module, hidden_states, master_weight_grads=False)
         batch, seq_len, features = projected.shape
@@ -351,7 +351,7 @@ class Mxfp8KvCacheCudaGraphSampler:
 
     @torch.no_grad()
     def prepare_encoder(self, encoder_hidden_states: torch.Tensor) -> None:
-        from benchmarks.bench_end_to_end import _packed_qkv
+        from plu.benchmarks.bench_end_to_end import _packed_qkv
 
         decoder = self.model.model.decoder
         for index, layer in enumerate(decoder.layers):
@@ -376,7 +376,7 @@ class Mxfp8KvCacheCudaGraphSampler:
 
     @torch.no_grad()
     def _decoder_step(self, *, compute_no_speech: bool = False) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        from benchmarks.bench_end_to_end import _packed_gelu_mlp, _packed_linear
+        from plu.benchmarks.bench_end_to_end import _packed_gelu_mlp, _packed_linear
         from plu.triton.decode_attention import cross_kv_cache_attention, self_kv_cache_attention
         from plu.triton.layer_norm import layer_norm
         from plu.triton.residual_add import residual_add
@@ -953,7 +953,7 @@ class Mxfp8KvCacheCudaGraphSampler:
 
 @torch.no_grad()
 def encode_packed_mxfp8(model: WhisperForConditionalGeneration, packed: dict[int, object], input_features: torch.Tensor) -> torch.Tensor:
-    from benchmarks.bench_end_to_end import _packed_encoder_layer
+    from plu.benchmarks.bench_end_to_end import _packed_encoder_layer
     from plu.triton.conv1d_gelu import conv1d_gelu
     from plu.triton.embedding import encoder_position_embedding
     from plu.triton.layer_norm import layer_norm
@@ -1023,7 +1023,7 @@ def main() -> None:
     model.eval().to(device=device, dtype=dtype)
     tokenizer = configure_tokenizer(model_path, model, args.language)
 
-    from benchmarks.bench_end_to_end import pack_mx_model
+    from plu.benchmarks.bench_end_to_end import pack_mx_model
 
     packed, stats = pack_mx_model(model, "mxfp8")
     logger.info("Packed %s PLU linear layers as MXFP8 for +test.", stats["mx_packed_linear_count"])

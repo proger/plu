@@ -15,7 +15,7 @@ if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 import plu.test as plu_test
-from benchmarks.bench_end_to_end import pack_mx_model
+from plu.benchmarks.bench_end_to_end import pack_mx_model
 from egs.uk1e2.local.decode_windows import (
     decode_timestamped_text,
     format_utt_id,

@@ -19,7 +19,7 @@ if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 import plu.test as plu_test
-from benchmarks.bench_end_to_end import pack_mx_model
+from plu.benchmarks.bench_end_to_end import pack_mx_model
 from plu.train_data import SAMPLE_RATE, _decode_pcm, _resample, load_audio, log_mel_spectrogram
 
 

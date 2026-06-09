@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from argparse import Namespace
 
-from benchmarks.bench_triton_ops import bench_qkv_proj
+from plu.benchmarks.bench_triton_ops import bench_qkv_proj
 
 
 def benchmark(args: Namespace):

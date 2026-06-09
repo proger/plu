@@ -25,7 +25,7 @@ os.environ.setdefault("PLU_OPS_BACKEND", "triton")
 import torch
 
 import plu.test as plu_test
-from benchmarks.bench_end_to_end import pack_mx_model
+from plu.benchmarks.bench_end_to_end import pack_mx_model
 
 
 DEFAULT_EXP = Path("egs/uk1e2/exp/news_100_large-v3-turbo_bf16_b1_ebwd24_cudagraph_mxfp8/train")
