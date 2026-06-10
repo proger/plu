@@ -67,8 +67,10 @@ def parse_args():
         default="openai/whisper-large-v3-turbo",
     )
     register_data_args(parser)
-    parser.add_argument("--learning_rate", type=float, default=1e-6, help="Initial learning rate to use.")
-    parser.add_argument("--weight_decay", type=float, default=1e-4, help="Weight decay to use.")
+    parser.add_argument("--learning_rate", type=float, default=1e-7, help="Initial learning rate to use.")
+    parser.add_argument("--weight_decay", type=float, default=0, help="Weight decay to use.")
+    parser.add_argument("--beta1", "--adam_beta1", dest="beta1", type=float, default=0, help="AdamW beta1.")
+    parser.add_argument("--beta2", "--adam_beta2", dest="beta2", type=float, default=0.9999, help="AdamW beta2.")
     parser.add_argument(
         "--lr_scheduler_type",
         type=str,
@@ -220,7 +222,14 @@ def get_lr_multiplier(name: str, step: int, total_steps: int) -> float:
 
 def make_optimizer(parameters, args: argparse.Namespace, device: torch.device) -> tuple[torch.optim.Optimizer, Tensor]:
     lr = torch.tensor(args.learning_rate, device=device, dtype=torch.float32)
-    optimizer = torch.optim.AdamW(list(parameters), lr=lr, weight_decay=args.weight_decay, fused=True, capturable=True)
+    optimizer = torch.optim.AdamW(
+        list(parameters),
+        lr=lr,
+        betas=(args.beta1, args.beta2),
+        weight_decay=args.weight_decay,
+        fused=True,
+        capturable=True,
+    )
     return optimizer, lr
 
 
@@ -534,7 +543,7 @@ def main():
     logger.info("Initial step = %s", initial_step)
     logger.info("Remaining optimization steps = %s", remaining_steps)
     logger.info("Decoder token buckets = %s", decoder_buckets)
-    logger.info("Optimizer = fused_adamw")
+    logger.info("Optimizer = fused_adamw; betas = (%s, %s); weight_decay = %s", args.beta1, args.beta2, args.weight_decay)
     logger.info(trainable_parameter_summary(model))
     logger.info(
         "Gradient clipping uses fused AdamW grad_scale from %s linear parameters and %s non-linear parameters.",
