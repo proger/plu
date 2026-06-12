@@ -286,11 +286,15 @@ def pack_mx_linear(module: torch.nn.Linear, format: str) -> PackedMxLinear:
     )
 
 
-def pack_mx_model(model: torch.nn.Module, format: str) -> tuple[dict[int, PackedMxLinear], dict[str, Any]]:
+def pack_mx_model(
+    model: torch.nn.Module,
+    format: str,
+    module_filter: Any | None = None,
+) -> tuple[dict[int, PackedMxLinear], dict[str, Any]]:
     pack_start = time.perf_counter()
     packed: dict[int, PackedMxLinear] = {}
     for module in model.modules():
-        if module.__class__.__name__ == "CastLinear":
+        if module.__class__.__name__ == "CastLinear" and (module_filter is None or module_filter(module)):
             packed[id(module)] = pack_mx_linear(module, format)
     pack_ms = (time.perf_counter() - pack_start) * 1000.0
     bf16_bytes = sum(linear.bf16_storage_bytes for linear in packed.values())
@@ -321,7 +325,10 @@ def _packed_linear(
     x: torch.Tensor,
     master_weight_grads: bool,
 ) -> torch.Tensor:
-    return packed[id(module)](x, master_weight_grads)
+    packed_linear = packed.get(id(module))
+    if packed_linear is None:
+        return module(x)
+    return packed_linear(x, master_weight_grads)
 
 
 def _packed_qkv(
@@ -331,7 +338,12 @@ def _packed_qkv(
     num_heads: int,
     master_weight_grads: bool,
 ) -> torch.Tensor:
-    return packed[id(module)].heads(x, num_heads, master_weight_grads)
+    packed_linear = packed.get(id(module))
+    if packed_linear is None:
+        from plu.whisper import qkv_proj
+
+        return qkv_proj(x, module.weight, module.bias, num_heads)
+    return packed_linear.heads(x, num_heads, master_weight_grads)
 
 
 def _packed_attention(
@@ -349,7 +361,12 @@ def _packed_attention(
     key = _packed_qkv(packed, module.k_proj, source, module.num_heads, master_weight_grads)
     value = _packed_qkv(packed, module.v_proj, source, module.num_heads, master_weight_grads)
     attended = flash_attention(query, key, value, causal_mask)
-    return packed[id(module.out_proj)].from_heads(attended, master_weight_grads)
+    packed_out = packed.get(id(module.out_proj))
+    if packed_out is None:
+        from plu.whisper import c_proj
+
+        return c_proj(attended, module.out_proj.weight, module.out_proj.bias)
+    return packed_out.from_heads(attended, master_weight_grads)
 
 
 class _PackedGelu(torch.autograd.Function):
@@ -379,6 +396,10 @@ def _packed_gelu_mlp(
     hidden_states: torch.Tensor,
     master_weight_grads: bool,
 ) -> torch.Tensor:
+    if id(fc1) not in packed and id(fc2) not in packed:
+        from plu.whisper import gelu_mlp
+
+        return gelu_mlp(hidden_states, fc1.weight, fc1.bias, fc2.weight, fc2.bias)
     preact = _packed_linear(packed, fc1, hidden_states, master_weight_grads)
     hidden = _packed_gelu(preact)
     return _packed_linear(packed, fc2, hidden, master_weight_grads)

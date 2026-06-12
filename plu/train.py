@@ -2,6 +2,7 @@ import argparse
 import concurrent.futures
 import json
 import logging
+import math
 import shlex
 import sys
 import time
@@ -20,13 +21,14 @@ from plu.whisper import WhisperForConditionalGeneration, resolve_model_path
 
 logger = logging.getLogger(__name__)
 TRAIN_DTYPE = torch.bfloat16
-LOSS_SKIP_THRESHOLD = 1.0
+LOSS_SKIP_THRESHOLD = 1.0e9
 LOGGING_STEPS = 100
 ROWS_PER_UPDATE = 1
 STATIC_INPUT_FEATURES = 3000
 DECODER_TOKEN_BUCKETS = (64, 96, 128, 160, 192, 224, 256, 320, 448)
 ENCODER_BACKWARD_LAYERS = 24
 TRAINING_STATE_FILENAME = "training_state.pt"
+DEFAULT_CLIP_GRAD_NORM = 1.0
 
 
 @dataclass
@@ -71,6 +73,13 @@ def parse_args():
     parser.add_argument("--weight_decay", type=float, default=0, help="Weight decay to use.")
     parser.add_argument("--beta1", "--adam_beta1", dest="beta1", type=float, default=0, help="AdamW beta1.")
     parser.add_argument("--beta2", "--adam_beta2", dest="beta2", type=float, default=0.9999, help="AdamW beta2.")
+    parser.add_argument("--clip_grad_norm", type=float, default=DEFAULT_CLIP_GRAD_NORM, help="Global gradient norm clipping threshold.")
+    parser.add_argument(
+        "--frozen_encoder_layers",
+        type=int,
+        default=None,
+        help="Number of encoder layers to freeze from the input side. Defaults to the current 24-backward-layer setup.",
+    )
     parser.add_argument(
         "--lr_scheduler_type",
         type=str,
@@ -133,6 +142,15 @@ def freeze_encoder_prefix(model: WhisperForConditionalGeneration, backward_layer
         for parameter in layer.parameters():
             parameter.requires_grad = False
     return frozen_layers
+
+
+def frozen_encoder_prefix_linear_ids(model: WhisperForConditionalGeneration, frozen_layers: int) -> set[int]:
+    ids: set[int] = set()
+    for layer in model.model.encoder.layers[:frozen_layers]:
+        for module in layer.modules():
+            if module.__class__.__name__ == "CastLinear":
+                ids.add(id(module))
+    return ids
 
 
 def trainable_parameter_summary(model: torch.nn.Module) -> str:
@@ -281,12 +299,13 @@ def update_clip_grad_scale(
     linear_records: list[Any],
     non_linear_parameters: list[torch.nn.Parameter],
     device: torch.device,
+    max_norm: float,
 ) -> ClipGradNorms:
     linear_norm_sq = linear_grad_norm_sq(linear_records, device)
     non_linear_norm_sq = parameter_grad_norm_sq(non_linear_parameters, device)
     total_norm_sq = linear_norm_sq + non_linear_norm_sq
     total_norm = total_norm_sq.sqrt()
-    scale.copy_(total_norm.clamp_min(1.0))
+    scale.copy_((total_norm / max_norm).clamp_min(1.0))
     return ClipGradNorms(total=total_norm, linear=linear_norm_sq.sqrt(), non_linear=non_linear_norm_sq.sqrt())
 
 
@@ -382,6 +401,7 @@ def capture_optimizer_graph(
     linear_records: list[Any],
     non_linear_parameters: list[torch.nn.Parameter],
     device: torch.device,
+    clip_grad_norm: float,
     restore_state: bool = False,
 ) -> OptimizerGraph:
     optimizer.zero_grad(set_to_none=False)
@@ -406,6 +426,7 @@ def capture_optimizer_graph(
             linear_records=linear_records,
             non_linear_parameters=non_linear_parameters,
             device=device,
+            max_norm=clip_grad_norm,
         )
         optimizer.step()
     torch.cuda.synchronize()
@@ -489,6 +510,8 @@ class TrainingBatchPrefetcher:
 
 def main():
     args = parse_args()
+    if not math.isfinite(args.clip_grad_norm) or args.clip_grad_norm <= 0:
+        raise ValueError(f"--clip_grad_norm must be finite and positive, got {args.clip_grad_norm}")
     logging.basicConfig(format="%(asctime)s - %(name)s - %(message)s", datefmt="%Y-%m-%dT%H:%M:%S%z", level=logging.INFO)
     logger.info("Invocation command: %s", shlex.join([sys.executable, *sys.argv]))
 
@@ -502,15 +525,26 @@ def main():
     model_dir = model_source_from_init(args.init)
     model = WhisperForConditionalGeneration.from_pretrained(model_dir)
     tokenizer = WhisperTokenizer.from_pretrained(model_dir, pad_token_id=model.config.pad_token_id)
-    backward_layers = min(ENCODER_BACKWARD_LAYERS, len(model.model.encoder.layers))
+    total_encoder_layers = len(model.model.encoder.layers)
+    if args.frozen_encoder_layers is None:
+        backward_layers = min(ENCODER_BACKWARD_LAYERS, total_encoder_layers)
+    else:
+        if args.frozen_encoder_layers < 0 or args.frozen_encoder_layers > total_encoder_layers:
+            raise ValueError(f"--frozen_encoder_layers={args.frozen_encoder_layers} is outside [0, {total_encoder_layers}]")
+        backward_layers = total_encoder_layers - args.frozen_encoder_layers
     model.to(device=device, dtype=TRAIN_DTYPE)
 
     frozen_encoder_layers = freeze_encoder_prefix(model, backward_layers)
     from plu.benchmarks.bench_end_to_end import pack_mx_model, packed_mx_forward
 
-    frozen_encoder_linears, mx_stats = pack_mx_model(model, "mxfp8")
+    frozen_encoder_linear_ids = frozen_encoder_prefix_linear_ids(model, frozen_encoder_layers)
+    frozen_encoder_linears, mx_stats = pack_mx_model(
+        model,
+        "mxfp8",
+        module_filter=lambda module: id(module) in frozen_encoder_linear_ids,
+    )
     logger.info(
-        "Packed %s model linear layers as MXFP8; frozen encoder prefix layers also use the packed path.",
+        "Packed %s frozen encoder prefix linear layers as MXFP8.",
         len(frozen_encoder_linears),
     )
 
@@ -544,6 +578,7 @@ def main():
     logger.info("Remaining optimization steps = %s", remaining_steps)
     logger.info("Decoder token buckets = %s", decoder_buckets)
     logger.info("Optimizer = fused_adamw; betas = (%s, %s); weight_decay = %s", args.beta1, args.beta2, args.weight_decay)
+    logger.info("Clip grad norm = %s", args.clip_grad_norm)
     logger.info(trainable_parameter_summary(model))
     logger.info(
         "Gradient clipping uses fused AdamW grad_scale from %s linear parameters and %s non-linear parameters.",
@@ -594,6 +629,7 @@ def main():
             linear_records=training_graph.grad_norm_records,
             non_linear_parameters=non_linear_parameters,
             device=device,
+            clip_grad_norm=args.clip_grad_norm,
             restore_state=initial_step > 0,
         )
         training_graph.optimizer_graph = optimizer_graph
@@ -633,13 +669,14 @@ def main():
             gpu_ms = start_event.elapsed_time(end_event)
             step_loss = float(training_graph.static_loss.detach().cpu())
             attach_grad_buffers(trainable_parameters, training_graph.grad_buffers)
-            update_skipped = step_loss > LOSS_SKIP_THRESHOLD
+            update_skipped = (not math.isfinite(step_loss)) or step_loss > LOSS_SKIP_THRESHOLD
             if update_skipped:
                 clip_grad_norms = update_clip_grad_scale(
                     scale=optimizer.grad_scale,
                     linear_records=training_graph.grad_norm_records,
                     non_linear_parameters=non_linear_parameters,
                     device=device,
+                    max_norm=args.clip_grad_norm,
                 )
                 torch.cuda.synchronize()
             else:
@@ -680,7 +717,7 @@ def main():
                 "train/step_gpu_ms": gpu_ms,
                 "train/step_wall_ms": 1000.0 * wall_seconds,
                 "train/grad_norm/pre_clip_total": float(clip_grad_norms.total.detach().cpu()),
-                "train/grad_norm/clip_max": 1.0,
+                "train/grad_norm/clip_max": args.clip_grad_norm,
                 "train/grad_norm/optimizer_grad_scale": float(optimizer.grad_scale.detach().cpu()),
                 "train/text_labels": batch.get("texts") or [],
             }
