@@ -26,9 +26,7 @@ LOGGING_STEPS = 100
 ROWS_PER_UPDATE = 1
 STATIC_INPUT_FEATURES = 3000
 DECODER_TOKEN_BUCKETS = (64, 96, 128, 160, 192, 224, 256, 320, 448)
-ENCODER_BACKWARD_LAYERS = 24
 TRAINING_STATE_FILENAME = "training_state.pt"
-DEFAULT_CLIP_GRAD_NORM = 1.0
 
 
 @dataclass
@@ -69,21 +67,21 @@ def parse_args():
         default="openai/whisper-large-v3-turbo",
     )
     register_data_args(parser)
-    parser.add_argument("--learning_rate", type=float, default=1e-7, help="Initial learning rate to use.")
+    parser.add_argument("--learning_rate", type=float, default=1.2e-5, help="Initial learning rate to use.")
     parser.add_argument("--weight_decay", type=float, default=0, help="Weight decay to use.")
     parser.add_argument("--beta1", "--adam_beta1", dest="beta1", type=float, default=0, help="AdamW beta1.")
     parser.add_argument("--beta2", "--adam_beta2", dest="beta2", type=float, default=0.9999, help="AdamW beta2.")
-    parser.add_argument("--clip_grad_norm", type=float, default=DEFAULT_CLIP_GRAD_NORM, help="Global gradient norm clipping threshold.")
+    parser.add_argument("--clip_grad_norm", type=float, default=1.0, help="Global gradient norm clipping threshold.")
     parser.add_argument(
         "--frozen_encoder_layers",
         type=int,
-        default=None,
-        help="Number of encoder layers to freeze from the input side. Defaults to the current 24-backward-layer setup.",
+        default=8,
+        help="Number of encoder layers to freeze from the input side.",
     )
     parser.add_argument(
         "--lr_scheduler_type",
         type=str,
-        default="constant",
+        default="linear",
         choices=["linear", "constant"],
         help="The scheduler type to use.",
     )
@@ -526,12 +524,9 @@ def main():
     model = WhisperForConditionalGeneration.from_pretrained(model_dir)
     tokenizer = WhisperTokenizer.from_pretrained(model_dir, pad_token_id=model.config.pad_token_id)
     total_encoder_layers = len(model.model.encoder.layers)
-    if args.frozen_encoder_layers is None:
-        backward_layers = min(ENCODER_BACKWARD_LAYERS, total_encoder_layers)
-    else:
-        if args.frozen_encoder_layers < 0 or args.frozen_encoder_layers > total_encoder_layers:
-            raise ValueError(f"--frozen_encoder_layers={args.frozen_encoder_layers} is outside [0, {total_encoder_layers}]")
-        backward_layers = total_encoder_layers - args.frozen_encoder_layers
+    if args.frozen_encoder_layers < 0 or args.frozen_encoder_layers > total_encoder_layers:
+        raise ValueError(f"--frozen_encoder_layers={args.frozen_encoder_layers} is outside [0, {total_encoder_layers}]")
+    backward_layers = total_encoder_layers - args.frozen_encoder_layers
     model.to(device=device, dtype=TRAIN_DTYPE)
 
     frozen_encoder_layers = freeze_encoder_prefix(model, backward_layers)
