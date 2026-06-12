@@ -77,6 +77,42 @@ def clean_text(row: dict[str, Any]) -> str:
     return " ".join(str(row.get("text_no_timestamps") or row.get("text") or "").split())
 
 
+def decoded_label_end(row: dict[str, Any]) -> float | None:
+    segments = row.get("sentence_segments") or []
+    ends = []
+    for segment in segments:
+        if not isinstance(segment, dict):
+            continue
+        try:
+            ends.append(float(segment["end"]))
+        except (KeyError, TypeError, ValueError):
+            continue
+    if ends:
+        return max(ends)
+
+    timestamps = row.get("sentence_end_timestamps") or []
+    for timestamp in timestamps:
+        if not isinstance(timestamp, dict):
+            continue
+        try:
+            ends.append(float(timestamp["offset"]))
+        except (KeyError, TypeError, ValueError):
+            continue
+    if ends:
+        return max(ends)
+    return None
+
+
+def label_audio_duration(row: dict[str, Any], duration: float) -> float:
+    label_end = decoded_label_end(row)
+    if label_end is None or label_end <= 0.0:
+        return duration
+    label_end = min(duration, label_end)
+    if label_end < duration - 0.05:
+        return label_end
+    return duration
+
+
 def base_prompt(tokenizer: Any, *, timestamps: bool) -> list[int]:
     if timestamps:
         return list(tokenizer.sot_sequence)
@@ -173,6 +209,11 @@ def main() -> None:
             if duration <= 0.0:
                 stats["skipped_nonpositive_duration"] += 1
                 continue
+            label_duration = label_audio_duration(row, duration)
+            if label_duration < duration:
+                stats["trimmed_to_label_timestamps"] += 1
+                stats["trimmed_audio_seconds"] += round(duration - label_duration, 6)
+                duration = label_duration
 
             input_ids = labels_for_row(
                 row,
@@ -231,21 +272,25 @@ def main() -> None:
     refs_tsv = out_dir / f"{args.prefix}.refs.tsv"
     wav_scp = out_dir / f"{args.prefix}.wav.scp"
     manifest_json = out_dir / f"{args.prefix}.manifest.json"
+    eval_rows = rows[: args.eval_limit]
+    train_rows = rows[args.eval_limit :]
+    train_audio_seconds = sum(float(row["duration"]) for row in train_rows)
+    eval_audio_seconds = sum(float(row["duration"]) for row in eval_rows)
 
     with train_jsonl.open("w", encoding="utf-8") as f:
-        for row in rows:
+        for row in train_rows:
             f.write(json.dumps(row, ensure_ascii=False) + "\n")
 
     with eval_jsonl.open("w", encoding="utf-8") as f:
-        for row in rows[: args.eval_limit]:
+        for row in eval_rows:
             f.write(json.dumps(row, ensure_ascii=False) + "\n")
 
     with refs_tsv.open("w", encoding="utf-8") as f:
-        for row in rows:
+        for row in train_rows:
             f.write(f"{row['id']}\t{row['path']}\t{row['start']:.2f}\t{row['duration']:.2f}\t{row['text']}\n")
 
     with wav_scp.open("w", encoding="utf-8") as f:
-        for row in rows:
+        for row in train_rows:
             f.write(f"{row['id']} {window_command(str(row['path']), float(row['start']), float(row['duration']))}\n")
 
     manifest = {
@@ -263,9 +308,15 @@ def main() -> None:
         "keep_context_prompt": args.keep_context_prompt,
         "max_label_tokens": args.max_label_tokens,
         "eval_limit": args.eval_limit,
+        "train_rows": len(train_rows),
+        "eval_rows": len(eval_rows),
         "recordings": len(recordings),
         "total_audio_seconds": round(total_audio_seconds, 3),
         "total_audio_hours": round(total_audio_seconds / 3600.0, 3),
+        "train_audio_seconds": round(train_audio_seconds, 3),
+        "train_audio_hours": round(train_audio_seconds / 3600.0, 3),
+        "eval_audio_seconds": round(eval_audio_seconds, 3),
+        "eval_audio_hours": round(eval_audio_seconds / 3600.0, 3),
         "stats": dict(stats),
     }
     manifest_json.write_text(json.dumps(manifest, ensure_ascii=False, indent=2, sort_keys=True) + "\n", encoding="utf-8")
