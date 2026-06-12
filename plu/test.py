@@ -87,6 +87,14 @@ def parse_args() -> argparse.Namespace:
         help="Number of decoder alternatives to run for each encoded file. B=1 is greedy; B>1 samples at temperature 1.",
     )
     parser.add_argument(
+        "--timestamp-tokens",
+        action="store_true",
+        help=(
+            "Decode with timestamp tokens using the timestamp-mode prompt: "
+            "<|startoftranscript|> <|lang|> <|transcribe|>, with timestamp tokens enabled."
+        ),
+    )
+    parser.add_argument(
         "filenames",
         type=Path,
         nargs="*",
@@ -172,6 +180,14 @@ def prompt_ids(
             context = context[-max_previous_tokens:]
         prompt = [tokenizer.sot_prev, *context, *prompt]
     return prompt
+
+
+def suppress_tokens(tokenizer: WhisperTokenizer, eos_token_id: int, *, allow_timestamps: bool) -> list[int]:
+    return [
+        token
+        for token in tokenizer.special_tokens.values()
+        if token != eos_token_id and (not allow_timestamps or token < tokenizer.timestamp_begin)
+    ]
 
 
 def load_input_features(filename: Path, n_mels: int, device: torch.device, dtype: torch.dtype) -> tuple[torch.Tensor, float]:
@@ -976,7 +992,7 @@ def recognize(
     logger.debug("recognize %s", filename)
     try:
         features, duration = load_input_features(filename, model.config.num_mel_bins, device, dtype)
-        prompt = prompt_ids(tokenizer, language)
+        prompt = sampler.prompt
         encoder_hidden_states = encode_packed_mxfp8(model, packed, features)
         samples = sampler.sample_many(encoder_hidden_states, max_new_tokens)
     except Exception:
@@ -1013,19 +1029,21 @@ def main() -> None:
     model = WhisperForConditionalGeneration.from_pretrained(model_path, map_location="cpu")
     model.eval().to(device=device, dtype=dtype)
     tokenizer = configure_tokenizer(model_path, model, args.language)
+    timestamp_tokens = bool(args.timestamp_tokens)
 
     from plu.benchmarks.bench_end_to_end import pack_mx_model
 
     packed, stats = pack_mx_model(model, "mxfp8")
     logger.info("Packed %s PLU linear layers as MXFP8 for +test.", stats["mx_packed_linear_count"])
-    prompt = prompt_ids(tokenizer, args.language)
+    prompt = prompt_ids(tokenizer, args.language, without_timestamps=not timestamp_tokens)
     sampler = Mxfp8KvCacheCudaGraphSampler(
         model,
         tokenizer,
         packed,
         prompt,
-        [token for token in tokenizer.special_tokens.values() if token != model.config.eos_token_id],
+        suppress_tokens(tokenizer, model.config.eos_token_id, allow_timestamps=timestamp_tokens),
         decode_batch_size=args.decode_batch_size,
+        timestamps_after_sentence_end=timestamp_tokens,
     )
     logger.info("Captured CUDA graph for PLU sampling in %.3f ms.", sampler.capture_ms)
 
