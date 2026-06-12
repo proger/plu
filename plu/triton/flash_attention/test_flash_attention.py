@@ -77,3 +77,31 @@ def test_flash_attention_bf16_non_contiguous_qkv_matches_contiguous():
     torch.testing.assert_close(query.grad, query_contiguous.grad, atol=0, rtol=0)
     torch.testing.assert_close(key.grad, key_contiguous.grad, atol=0, rtol=0)
     torch.testing.assert_close(value.grad, value_contiguous.grad, atol=0, rtol=0)
+
+
+@pytest.mark.parametrize(("query_len", "key_len"), [(256, 256), (64, 256)])
+def test_flash_attention_bf16_backward_is_deterministic_for_tiled_reductions(query_len, key_len):
+    torch.manual_seed(2)
+    batch, heads, head_dim = 1, 4, 64
+    query = torch.randn(batch, heads, query_len, head_dim, device="cuda", dtype=torch.bfloat16)
+    key = torch.randn(batch, heads, key_len, head_dim, device="cuda", dtype=torch.bfloat16)
+    value = torch.randn(batch, heads, key_len, head_dim, device="cuda", dtype=torch.bfloat16)
+    grad = torch.randn(batch, heads, query_len, head_dim, device="cuda", dtype=torch.bfloat16)
+
+    outs = []
+    grads = []
+    for _ in range(2):
+        current_query, current_key, current_value = _clone_args(
+            query.requires_grad_(),
+            key.requires_grad_(),
+            value.requires_grad_(),
+        )
+        out = triton_flash_attention(current_query, current_key, current_value)
+        out.backward(grad)
+        torch.cuda.synchronize()
+        outs.append(out.detach())
+        grads.append((current_query.grad.detach(), current_key.grad.detach(), current_value.grad.detach()))
+
+    torch.testing.assert_close(outs[1], outs[0], atol=0, rtol=0)
+    for actual, expected in zip(grads[1], grads[0]):
+        torch.testing.assert_close(actual, expected, atol=0, rtol=0)

@@ -222,11 +222,11 @@ def _linear_weight_grad_reduce_kernel(
     if collect_norms:
         weight_mask = (offs_n[:, None] < out_features) & (offs_k[None, :] < in_features)
         weight_norm_sq = tl.sum(tl.where(weight_mask, acc * acc, 0.0))
-        tl.atomic_add(grad_weight_norm_sq_ptr, weight_norm_sq, sem="relaxed")
+        tl.store(grad_weight_norm_sq_ptr + pid_n * grid_k + pid_k, weight_norm_sq)
         if has_bias and pid_k == 0:
             bias_mask = offs_n < out_features
             bias_norm_sq = tl.sum(tl.where(bias_mask, bias_acc * bias_acc, 0.0))
-            tl.atomic_add(grad_bias_norm_sq_ptr, bias_norm_sq, sem="relaxed")
+            tl.store(grad_bias_norm_sq_ptr + pid_n, bias_norm_sq)
 
 
 def linear_input_grad(grad_out: Tensor, weight: Tensor, out_dtype: torch.dtype | None = None) -> Tensor:
@@ -315,8 +315,8 @@ def _linear_weight_bias_grad(
     grid_n = triton.cdiv(out_features, block_n)
     grid_k = triton.cdiv(in_features, block_k)
     collect_norms = _LINEAR_GRAD_NORM_RECORDS is not None
-    grad_weight_norm_sq = torch.zeros((), device=grad_out.device, dtype=torch.float32) if collect_norms else grad_weight
-    grad_bias_norm_sq = torch.zeros((), device=grad_out.device, dtype=torch.float32) if collect_norms and has_bias else grad_weight
+    grad_weight_norm_sq = torch.empty((grid_n, grid_k), device=grad_out.device, dtype=torch.float32) if collect_norms else grad_weight
+    grad_bias_norm_sq = torch.empty((grid_n,), device=grad_out.device, dtype=torch.float32) if collect_norms and has_bias else grad_weight
     inputs_are_bf16 = grad_out.dtype == torch.bfloat16 and x.dtype == torch.bfloat16
     num_stages = 1 if inputs_are_bf16 and has_bias else 3
     _linear_weight_grad_reduce_kernel[(grid_n, grid_k)](

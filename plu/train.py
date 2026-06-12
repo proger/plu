@@ -262,8 +262,8 @@ def linear_grad_norm_metadata(records: list[Any]) -> dict[str, float]:
 def linear_grad_norm_sq(records: list[Any], device: torch.device) -> Tensor:
     if not records:
         return torch.zeros((), device=device, dtype=torch.float32)
-    parts = [record.weight_norm_sq.reshape(()) for record in records]
-    parts.extend(record.bias_norm_sq.reshape(()) for record in records if record.bias_norm_sq is not None)
+    parts = [record.weight_norm_sq.reshape(-1).sum() for record in records]
+    parts.extend(record.bias_norm_sq.reshape(-1).sum() for record in records if record.bias_norm_sq is not None)
     return torch.stack(parts).sum()
 
 
