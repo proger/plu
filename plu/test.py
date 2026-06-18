@@ -11,7 +11,7 @@ import torch
 
 from plu.triton.sampling import make_suppress_mask, sample_next_token, update_decode_control_
 from plu.tokenizer import LANGUAGES, TO_LANGUAGE_CODE, WhisperTokenizer
-from plu.train_data import SAMPLE_RATE, load_audio, log_mel_spectrogram
+from plu.train_data import CHUNK_LENGTH, SAMPLE_RATE, load_audio, log_mel_spectrogram
 from plu.whisper import WhisperForConditionalGeneration, resolve_model_path
 
 
@@ -33,6 +33,9 @@ MODEL_ALIASES = {
     "large-v3-turbo": "openai/whisper-large-v3-turbo",
     "turbo": "openai/whisper-large-v3-turbo",
 }
+
+TIMESTAMP_SENTENCE_ENDS = (".", "!", "?", "。", "！", "？")
+TIMESTAMP_SUBSENTENCE_ENDS = (*TIMESTAMP_SENTENCE_ENDS, ",", ";", ":", "…", "，", "；", "：")
 
 
 def parse_args() -> argparse.Namespace:
@@ -84,7 +87,13 @@ def parse_args() -> argparse.Namespace:
         "--decode_batch_size",
         type=int,
         default=1,
-        help="Number of decoder alternatives to run for each encoded file. B=1 is greedy; B>1 samples at temperature 1.",
+        help="Number of decoder alternatives to run for each encoded file. B=1 is greedy; B>1 samples.",
+    )
+    parser.add_argument(
+        "--temperature",
+        type=float,
+        default=1.0,
+        help="Sampling temperature for non-greedy alternatives when --decode_batch_size > 1.",
     )
     parser.add_argument(
         "--timestamp-tokens",
@@ -93,6 +102,25 @@ def parse_args() -> argparse.Namespace:
             "Decode with timestamp tokens using the timestamp-mode prompt: "
             "<|startoftranscript|> <|lang|> <|transcribe|>, with timestamp tokens enabled."
         ),
+    )
+    parser.add_argument(
+        "--stride-seconds",
+        type=float,
+        default=15.0,
+        help="Seconds between fixed 30s window starts for raw-audio decoding.",
+    )
+    parser.add_argument(
+        "--stride-tokens",
+        default="0",
+        help=(
+            "For 30s windowed decoding, prepend up to this many previous decoded text tokens with <|startofprev|>. "
+            "Use 'timestamp' to decode timestamps and cut each window to its non-overlap stride interval."
+        ),
+    )
+    parser.add_argument(
+        "--suppress-eot",
+        action="store_true",
+        help="Suppress the end-of-text token during decoding so generation only stops at the length limit.",
     )
     parser.add_argument(
         "filenames",
@@ -182,11 +210,11 @@ def prompt_ids(
     return prompt
 
 
-def suppress_tokens(tokenizer: WhisperTokenizer, eos_token_id: int, *, allow_timestamps: bool) -> list[int]:
+def suppress_tokens(tokenizer: WhisperTokenizer, eos_token_id: int, *, allow_timestamps: bool, suppress_eot: bool = False) -> list[int]:
     return [
         token
         for token in tokenizer.special_tokens.values()
-        if token != eos_token_id and (not allow_timestamps or token < tokenizer.timestamp_begin)
+        if (suppress_eot or token != eos_token_id) and (not allow_timestamps or token < tokenizer.timestamp_begin)
     ]
 
 
@@ -202,6 +230,110 @@ def load_input_features(filename: Path, n_mels: int, device: torch.device, dtype
     return features.unsqueeze(0).to(device=device, dtype=dtype), duration
 
 
+def load_window_input_features(
+    filename: Path,
+    n_mels: int,
+    device: torch.device,
+    dtype: torch.dtype,
+    *,
+    start: float,
+    duration: float,
+) -> tuple[torch.Tensor, float]:
+    audio = load_audio(filename, start=start, duration=duration).flatten().float()
+    actual_duration = float(audio.numel()) / SAMPLE_RATE
+    features = log_mel_spectrogram(audio, n_mels)
+    return features.unsqueeze(0).to(device=device, dtype=dtype), actual_duration
+
+
+def text_context_tokens(tokenizer: WhisperTokenizer, token_ids: Sequence[int]) -> list[int]:
+    special_tokens = set(tokenizer.special_tokens.values())
+    return [
+        int(token)
+        for token in token_ids
+        if int(token) not in special_tokens and int(token) < tokenizer.timestamp_begin
+    ]
+
+
+def timestamp_seconds(tokenizer: WhisperTokenizer, token: int) -> float:
+    return float(int(token) - tokenizer.timestamp_begin) * 0.02
+
+
+def cut_generated_by_timestamps(
+    tokenizer: WhisperTokenizer,
+    generated: Sequence[int],
+    *,
+    window_start: float,
+    cut_start: float,
+    cut_end: float,
+    is_final: bool,
+) -> tuple[list[int], bool]:
+    segments: list[tuple[float, float, list[int]]] = []
+    current_start: float | None = None
+    current_tokens: list[int] = []
+
+    for raw_token in generated:
+        token = int(raw_token)
+        if token >= tokenizer.timestamp_begin:
+            timestamp = window_start + timestamp_seconds(tokenizer, token)
+            if current_start is not None and current_tokens:
+                segments.append((current_start, timestamp, current_tokens))
+            current_start = timestamp
+            current_tokens = []
+        elif token not in tokenizer.special_tokens.values():
+            if current_start is None:
+                current_start = window_start
+            current_tokens.append(token)
+
+    if current_start is not None and current_tokens:
+        segments.append((current_start, window_start + float(CHUNK_LENGTH), current_tokens))
+
+    kept: list[int] = []
+    had_split = False
+    for start, end, tokens in segments:
+        overlap_start = max(start, cut_start)
+        overlap_end = min(end, cut_end)
+        if is_final:
+            has_overlap = overlap_start <= overlap_end
+        else:
+            has_overlap = overlap_start < overlap_end
+        if not has_overlap:
+            continue
+
+        duration = max(end - start, 1e-6)
+        if overlap_start > start + 1e-3 or overlap_end < end - 1e-3:
+            had_split = True
+        token_start = int(len(tokens) * max(0.0, min(1.0, (overlap_start - start) / duration)))
+        token_end = int(len(tokens) * max(0.0, min(1.0, (overlap_end - start) / duration)) + 0.999999)
+        token_start = max(0, min(len(tokens), token_start))
+        token_end = max(token_start, min(len(tokens), token_end))
+        if token_end <= token_start:
+            continue
+
+        rel_start = max(0.0, min(float(CHUNK_LENGTH), overlap_start - window_start))
+        rel_end = max(rel_start, min(float(CHUNK_LENGTH), overlap_end - window_start))
+        kept.append(tokenizer.timestamp_begin + round(rel_start / 0.02))
+        kept.extend(tokens[token_start:token_end])
+        kept.append(tokenizer.timestamp_begin + round(rel_end / 0.02))
+    return kept, had_split
+
+
+def window_starts(duration: float, window_seconds: float, window_stride: float) -> list[float]:
+    if duration <= 0.0:
+        return [0.0]
+    if duration <= window_seconds:
+        return [0.0]
+
+    starts: list[float] = []
+    start = 0.0
+    while start + window_seconds < duration:
+        starts.append(start)
+        start += window_stride
+    final_start = max(0.0, duration - window_seconds)
+    if not starts or final_start - starts[-1] > 1e-3:
+        starts.append(final_start)
+    return starts
+
+
 class Mxfp8KvCacheCudaGraphSampler:
     def __init__(
         self,
@@ -212,12 +344,15 @@ class Mxfp8KvCacheCudaGraphSampler:
         suppress_tokens: list[int],
         decode_batch_size: int = 1,
         timestamps_after_sentence_end: bool = False,
+        temperature: float = 1.0,
         cross_cache_batch_size: int | None = None,
         cross_key_caches: list[torch.Tensor] | None = None,
         cross_value_caches: list[torch.Tensor] | None = None,
     ):
         if decode_batch_size < 1:
             raise ValueError("--decode_batch_size must be at least 1")
+        if temperature <= 0.0:
+            raise ValueError(f"temperature must be positive, got {temperature}")
         if cross_cache_batch_size is None:
             cross_cache_batch_size = decode_batch_size
         if cross_cache_batch_size < 1:
@@ -230,6 +365,7 @@ class Mxfp8KvCacheCudaGraphSampler:
         self.prompt = prompt
         self.decode_batch_size = decode_batch_size
         self.cross_cache_batch_size = cross_cache_batch_size
+        self.temperature = float(temperature)
         self.timestamps_after_sentence_end = timestamps_after_sentence_end
         self.device = next(model.parameters()).device
         self.dtype = next(model.parameters()).dtype
@@ -245,11 +381,8 @@ class Mxfp8KvCacheCudaGraphSampler:
             dtype=torch.long,
         )
         self.suppress_mask = make_suppress_mask(model.config.vocab_size, self.suppress_tokens, device=self.device)
-        sentence_end_token_mask = torch.zeros(model.config.vocab_size, dtype=torch.bool)
-        for token in range(min(self.timestamp_begin, model.config.vocab_size)):
-            if token != self.eos_token_id and tokenizer.decode([token]).rstrip().endswith((".", "!", "?")):
-                sentence_end_token_mask[token] = True
-        self.sentence_end_token_mask = sentence_end_token_mask.to(device=self.device)
+        self.sentence_end_token_mask = self._make_timestamp_punctuation_mask(TIMESTAMP_SENTENCE_ENDS)
+        self.subsentence_sentence_end_token_mask = self._make_timestamp_punctuation_mask(TIMESTAMP_SUBSENTENCE_ENDS)
         self.static_current_token = torch.full((self.decode_batch_size,), self.eos_token_id, device=self.device, dtype=torch.long)
         self.static_position = torch.zeros(self.decode_batch_size, device=self.device, dtype=torch.long)
         self.static_force_timestamp = torch.zeros(self.decode_batch_size, device=self.device, dtype=torch.bool)
@@ -335,6 +468,13 @@ class Mxfp8KvCacheCudaGraphSampler:
         self.prompt_graph_no_speech_prob: torch.Tensor | None = None
         self.capture_ms = 0.0
         self._capture()
+
+    def _make_timestamp_punctuation_mask(self, punctuation_ends: tuple[str, ...]) -> torch.Tensor:
+        mask = torch.zeros(self.model.config.vocab_size, dtype=torch.bool)
+        for token in range(min(self.timestamp_begin, self.model.config.vocab_size)):
+            if token != self.eos_token_id and self.tokenizer.decode([token]).rstrip().endswith(punctuation_ends):
+                mask[token] = True
+        return mask.to(device=self.device)
 
     def _grouped_cross_cache_index(self, prompt_count: int, alternatives_per_prompt: int) -> torch.Tensor:
         key = (prompt_count, alternatives_per_prompt)
@@ -438,6 +578,7 @@ class Mxfp8KvCacheCudaGraphSampler:
             pair_timestamp_tokens=self.static_pair_timestamp_token,
             greedy_batch_mask=None if self.decode_batch_size == 1 else self.greedy_batch_mask,
             seed=self.static_sampling_seed,
+            temperature=self.temperature,
         )
         return next_token, selected_logprob, no_speech_prob
 
@@ -977,6 +1118,77 @@ def encode_packed_mxfp8(model: WhisperForConditionalGeneration, packed: dict[int
     return layer_norm(hidden_states, encoder.layer_norm.weight, encoder.layer_norm.bias, encoder.layer_norm.eps)
 
 
+def decode_features(
+    model: WhisperForConditionalGeneration,
+    tokenizer: WhisperTokenizer,
+    packed: dict[int, object],
+    sampler: Mxfp8KvCacheCudaGraphSampler,
+    features: torch.Tensor,
+    *,
+    filename: Path,
+    language: str | None,
+    max_new_tokens: int,
+    start: float,
+    end: float,
+    window_index: int | None = None,
+    prompt: list[int] | None = None,
+    timestamp_cut: tuple[float, float, bool] | None = None,
+    use_subsentence_punctuation: bool = False,
+) -> list[dict[str, object]]:
+    prompt = sampler.prompt if prompt is None else prompt
+    encoder_hidden_states = encode_packed_mxfp8(model, packed, features)
+    original_sentence_end_token_mask = sampler.sentence_end_token_mask
+    try:
+        if use_subsentence_punctuation:
+            sampler.sentence_end_token_mask = sampler.subsentence_sentence_end_token_mask
+        samples = sampler.sample_many(encoder_hidden_states, max_new_tokens, prompt=prompt)
+    finally:
+        sampler.sentence_end_token_mask = original_sentence_end_token_mask
+
+    segments: list[dict[str, object]] = []
+    for index, (token_ids, logprobs, no_speech_prob) in enumerate(samples):
+        generated = token_ids[len(prompt) :]
+        if timestamp_cut is None:
+            output_generated = generated
+            output_start = start
+            output_end = end
+            cut_had_split = False
+        else:
+            cut_start, cut_end, is_final = timestamp_cut
+            output_generated, cut_had_split = cut_generated_by_timestamps(
+                tokenizer,
+                generated,
+                window_start=start,
+                cut_start=cut_start,
+                cut_end=cut_end,
+                is_final=is_final,
+            )
+            output_start = cut_start
+            output_end = cut_end
+        text = tokenizer.batch_decode([output_generated], skip_special_tokens=True)[0].strip()
+        avg_logprob = sum(logprobs) / len(logprobs) if logprobs else 0.0
+        segment = {
+            "i": index,
+            "start": round(output_start, 2),
+            "end": round(output_end, 2),
+            "text": text,
+            "conf": None,
+            "avg_logprob": round(avg_logprob, 3),
+            "no_speech_prob": round(no_speech_prob, 3),
+            "path": str(filename),
+            "language": language or "",
+            "langprob": 1.0 if language else 0.0,
+            "input_ids": prompt + output_generated,
+        }
+        if window_index is not None:
+            segment["window_i"] = window_index
+        if timestamp_cut is not None:
+            segment["timestamp_cut_had_split"] = cut_had_split
+            segment["timestamp_punctuation"] = "subsentence" if use_subsentence_punctuation else "sentence"
+        segments.append(segment)
+    return segments
+
+
 def recognize(
     model: WhisperForConditionalGeneration,
     tokenizer: WhisperTokenizer,
@@ -988,35 +1200,100 @@ def recognize(
     dtype: torch.dtype,
     device: torch.device,
     max_new_tokens: int,
+    stride_seconds: float,
+    stride_tokens: int = 0,
+    timestamp_stride: bool = False,
+    without_timestamps: bool = True,
 ):
     logger.debug("recognize %s", filename)
     try:
-        features, duration = load_input_features(filename, model.config.num_mel_bins, device, dtype)
-        prompt = sampler.prompt
-        encoder_hidden_states = encode_packed_mxfp8(model, packed, features)
-        samples = sampler.sample_many(encoder_hidden_states, max_new_tokens)
+        loaded = load_audio(filename)
+        if loaded.ndim == 2 and loaded.shape[0] == model.config.num_mel_bins:
+            features = loaded.float().unsqueeze(0).to(device=device, dtype=dtype)
+            duration = float(loaded.shape[-1]) / 100.0
+            yield from decode_features(
+                model,
+                tokenizer,
+                packed,
+                sampler,
+                features,
+                filename=filename,
+                language=language,
+                max_new_tokens=max_new_tokens,
+                start=0.0,
+                end=duration,
+            )
+            return
+
+        full_audio = loaded.flatten()
+        full_duration = float(full_audio.numel()) / SAMPLE_RATE
+        window_seconds = float(CHUNK_LENGTH)
+        previous_text_tokens: list[int] = []
+        starts = window_starts(full_duration, window_seconds, stride_seconds)
+        for window_index, start in enumerate(starts):
+            features = log_mel_spectrogram(
+                full_audio[round(start * SAMPLE_RATE) : round(min(full_duration, start + window_seconds) * SAMPLE_RATE)].float(),
+                model.config.num_mel_bins,
+            )
+            actual_duration = min(window_seconds, max(0.0, full_duration - start))
+            features = features.unsqueeze(0).to(device=device, dtype=dtype)
+            end = min(full_duration, start + actual_duration)
+            prompt = (
+                prompt_ids(
+                    tokenizer,
+                    language,
+                    without_timestamps=without_timestamps,
+                    previous_tokens=previous_text_tokens,
+                    max_previous_tokens=stride_tokens,
+                )
+                if stride_tokens > 0 and previous_text_tokens
+                else sampler.prompt
+            )
+            timestamp_cut = None
+            if timestamp_stride:
+                cut_start = start
+                cut_end = starts[window_index + 1] if window_index + 1 < len(starts) else full_duration
+                timestamp_cut = (cut_start, cut_end, window_index + 1 >= len(starts))
+            segments = decode_features(
+                model,
+                tokenizer,
+                packed,
+                sampler,
+                features,
+                filename=filename,
+                language=language,
+                max_new_tokens=max_new_tokens,
+                start=start,
+                end=end,
+                window_index=window_index,
+                prompt=prompt,
+                timestamp_cut=timestamp_cut,
+            )
+            if timestamp_stride and segments and bool(segments[0].get("timestamp_cut_had_split")):
+                segments = decode_features(
+                    model,
+                    tokenizer,
+                    packed,
+                    sampler,
+                    features,
+                    filename=filename,
+                    language=language,
+                    max_new_tokens=max_new_tokens,
+                    start=start,
+                    end=end,
+                    window_index=window_index,
+                    prompt=prompt,
+                    timestamp_cut=timestamp_cut,
+                    use_subsentence_punctuation=True,
+                )
+            if stride_tokens > 0 and segments:
+                greedy_generated = list(segments[0]["input_ids"])[len(prompt) :]
+                previous_text_tokens.extend(text_context_tokens(tokenizer, greedy_generated))
+                previous_text_tokens = previous_text_tokens[-stride_tokens:]
+            yield from segments
     except Exception:
         logger.exception("failed to recognize %s", filename)
         return
-
-    for index, (token_ids, logprobs, no_speech_prob) in enumerate(samples):
-        generated = token_ids[len(prompt) :]
-        text = tokenizer.batch_decode([generated], skip_special_tokens=True)[0].strip()
-        avg_logprob = sum(logprobs) / len(logprobs) if logprobs else 0.0
-
-        yield {
-            "i": index,
-            "start": 0.0,
-            "end": round(duration, 2),
-            "text": text,
-            "conf": None,
-            "avg_logprob": round(avg_logprob, 3),
-            "no_speech_prob": round(no_speech_prob, 3),
-            "path": str(filename),
-            "language": language or "",
-            "langprob": 1.0 if language else 0.0,
-            "input_ids": token_ids,
-        }
 
 
 def main() -> None:
@@ -1024,12 +1301,24 @@ def main() -> None:
     device = resolve_device(args.device)
     dtype = parse_dtype(args.dtype)
     args.language = normalize_language(args.language)
+    if args.stride_seconds <= 0.0 or args.stride_seconds > float(CHUNK_LENGTH):
+        raise ValueError(f"--stride-seconds must be in (0, {CHUNK_LENGTH}]")
+    timestamp_stride = str(args.stride_tokens).lower() == "timestamp"
+    if timestamp_stride:
+        stride_tokens = 0
+    else:
+        try:
+            stride_tokens = int(args.stride_tokens)
+        except ValueError as exc:
+            raise ValueError("--stride-tokens must be a non-negative integer or 'timestamp'") from exc
+        if stride_tokens < 0:
+            raise ValueError("--stride-tokens must be non-negative")
     model_path = resolve_requested_model(args)
 
     model = WhisperForConditionalGeneration.from_pretrained(model_path, map_location="cpu")
     model.eval().to(device=device, dtype=dtype)
     tokenizer = configure_tokenizer(model_path, model, args.language)
-    timestamp_tokens = bool(args.timestamp_tokens)
+    timestamp_tokens = bool(args.timestamp_tokens or timestamp_stride)
 
     from plu.benchmarks.bench_end_to_end import pack_mx_model
 
@@ -1041,9 +1330,10 @@ def main() -> None:
         tokenizer,
         packed,
         prompt,
-        suppress_tokens(tokenizer, model.config.eos_token_id, allow_timestamps=timestamp_tokens),
+        suppress_tokens(tokenizer, model.config.eos_token_id, allow_timestamps=timestamp_tokens, suppress_eot=args.suppress_eot),
         decode_batch_size=args.decode_batch_size,
         timestamps_after_sentence_end=timestamp_tokens,
+        temperature=args.temperature,
     )
     logger.info("Captured CUDA graph for PLU sampling in %.3f ms.", sampler.capture_ms)
 
@@ -1058,6 +1348,10 @@ def main() -> None:
             dtype=dtype,
             device=device,
             max_new_tokens=args.max_new_tokens,
+            stride_seconds=args.stride_seconds,
+            stride_tokens=stride_tokens,
+            timestamp_stride=timestamp_stride,
+            without_timestamps=not timestamp_tokens,
         ):
             print(json.dumps(seg, ensure_ascii=False))
 

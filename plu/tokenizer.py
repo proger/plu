@@ -513,7 +513,10 @@ class Tokenizer:
 
     @cached_property
     def no_speech(self) -> int:
-        return self.special_tokens["<|nospeech|>"]
+        token = self.special_tokens.get("<|nospeech|>")
+        if token is not None:
+            return token
+        return self.special_tokens["<|nocaptions|>"]
 
     @cached_property
     def no_timestamps(self) -> int:
