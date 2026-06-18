@@ -1,0 +1,13 @@
+model	trainable_params	width	encoder_depth	decoder_depth	eval_set	best_learning_rate	best_wer_percent	mean_avg_logprob	run	results_path
+small	241734912	768	12	12	ATC validation	5e-05	11.227527086557924	-0.05558128078817734	lr5e-5_b10_b20p9999	egs/atc/exp/20260614_234441_atc_whisper_small_lr13_validation/results_atc_validation.jsonl
+small	241734912	768	12	12	ATC test	5e-05	10.599294947121034	-0.05287945879458795	lr5e-5_b10_b20p9999	egs/atc/exp/20260614_234441_atc_whisper_small_lr13_atc_test/results_atc_test.jsonl
+medium	763857920	1024	24	24	ATC validation	2e-05	7.810453625431599	-0.03958743842364532	lr2e-5_b10_b20p9999	egs/atc/exp/20260614_234441_atc_whisper_medium_lr13_validation/results_atc_validation.jsonl
+medium	763857920	1024	24	24	ATC test	1.5e-05	7.92009400705053	-0.04003321033210332	lr1p5e-5_b10_b20p9999	egs/atc/exp/20260614_234441_atc_whisper_medium_lr13_atc_test/results_atc_test.jsonl
+turbo	808878080	1280	32	4	ATC validation	1.2e-05	7.762828908203358	-0.039506157635467984	lr1p2e-5_b10_b20p9999	egs/atc/exp/20260611_014153_atc_linear_lr_b10_b20p9999_ext_notimestamps_max96/results.jsonl
+turbo	808878080	1280	32	4	ATC test	1e-05	8.061104582843713	-0.041584255842558426	lr1e-5_b10_b20p9999	egs/atc/exp/20260612_214716_atc_only_lr10_base_atc_test/results_atc_test.jsonl
+large-v1	1543304960	1280	32	32	ATC validation	1.5e-05	7.298487915228004	-0.03572660098522168	lr1p5e-5_b10_b20p9999	egs/atc/exp/20260616_181815_atc_whisper_large_v1_lr13_validation/results_atc_validation.jsonl
+large-v1	1543304960	1280	32	32	ATC test	1e-05	7.508813160987074	-0.04012054120541206	lr1e-5_b10_b20p9999	egs/atc/exp/20260616_181815_atc_whisper_large_v1_lr13_atc_test/results_atc_test.jsonl
+large-v2	1543304960	1280	32	32	ATC validation	1.2e-05	7.119895225622098	-0.036564039408866995	lr1p2e-5_b10_b20p9999	egs/atc/exp/20260616_100945_atc_whisper_large_v2_focused_lr_validation/results_atc_validation.jsonl
+large-v2	1543304960	1280	32	32	ATC test	1e-05	7.215041128084606	-0.03867527675276753	lr1e-5_b10_b20p9999	egs/atc/exp/20260616_100945_atc_whisper_large_v2_focused_lr_atc_test/results_atc_test.jsonl
+large-v3	1543490560	1280	32	32	ATC validation	1.5e-05	7.1675199428503396	-0.035230295566502465	lr1p5e-5_b10_b20p9999	egs/atc/exp/20260616_100945_atc_whisper_large_v3_focused_lr_filtered/results_atc_validation.jsonl
+large-v3	1543490560	1280	32	32	ATC test	1.5e-05	7.015276145710929	-0.036220172201722016	lr1p5e-5_b10_b20p9999	egs/atc/exp/20260616_100945_atc_whisper_large_v3_focused_lr_filtered/results_atc_test.jsonl
